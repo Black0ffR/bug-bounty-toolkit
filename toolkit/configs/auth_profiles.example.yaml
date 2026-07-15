@@ -1,0 +1,49 @@
+# auth_profiles.yaml — TEMPLATE. Copy to auth_profiles.yaml and edit before use.
+# Real auth_profiles.yaml files MUST be gitignored — they contain session tokens.
+#
+# Format reference: ARCHITECTURE.md §3.3
+#
+# At minimum, idor_crosssession.py needs two non-anon profiles (user_a + user_b)
+# with valid session cookies / bearer tokens. The 'anon' profile is auto-added
+# if missing and is used by tools that want to compare authed vs unauthed access.
+#
+# 'user_id' is used by idor_crosssession.py for blast-radius testing — set it to
+# the numeric or UUID identifier the API uses for this user. The tool will try
+# adjacent IDs to estimate how many records an attacker could walk.
+#
+# Redaction: every value in the 'cookie', 'bearer', 'api_key', 'password',
+# 'token', or 'secret' fields is automatically masked in any log output.
+# Use 'bearer' for OAuth/JWT tokens, 'cookie' for session cookies, 'api_key'
+# for X-Api-Key auth, or 'headers' for arbitrary custom headers.
+
+profiles:
+  anon: {}                    # anonymous — no auth
+
+  user_a:                     # primary identity (the "victim" in BOLA tests)
+    cookie: "session=abc123def456..."
+    headers:
+      X-User-Role: "standard"
+    user_id: 8841             # this user's numeric ID in the target API
+
+  user_b:                     # second identity (the "attacker" in BOLA tests)
+    cookie: "session=ghi789jkl012..."
+    headers:
+      X-User-Role: "standard"
+    user_id: 9102
+
+  admin:                      # privileged identity (for privilege-escalation tests)
+    cookie: "session=mnop345qrst678..."
+    headers:
+      X-User-Role: "admin"
+    user_id: 1
+
+  # Example: bearer-token profile (OAuth2 / JWT)
+  # mobile_app:
+  #   bearer: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  #   user_id: "550e8400-e29b-41d4-a716-446655440000"
+
+  # Example: API-key profile
+  # service_account:
+  #   api_key: "sk_live_..."
+  #   headers:
+  #     X-Service-Name: "internal-cron"

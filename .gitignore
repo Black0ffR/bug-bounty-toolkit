@@ -1,0 +1,37 @@
+# .gitignore — keeps real target configs out of source control
+# Copy to your repo's .gitignore
+
+# Real target configs (replace example files before real use)
+scope.yaml
+auth_profiles.yaml
+!toolkit/configs/*.example.yaml
+
+# Pipeline state + outputs
+pipeline_state.db
+pipeline_state.db-journal
+pipeline_state.db-wal
+pipeline_state.db-shm
+blocked.log
+subtakeover.db
+work/
+reports/
+*.json
+!toolkit/**/testdata/*.json
+!toolkit/configs/*.example.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.egg-info/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

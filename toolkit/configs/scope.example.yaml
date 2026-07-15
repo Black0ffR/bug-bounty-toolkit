@@ -1,0 +1,28 @@
+# scope.yaml — TEMPLATE. Copy to scope.yaml and edit before use.
+# Real scope.yaml files should be gitignored — they identify the target program.
+#
+# Format reference: ARCHITECTURE.md §3.2
+#
+# Wildcard syntax:
+#   *.acme.com          matches acme.com AND any subdomain (www.acme.com, a.b.acme.com)
+#   api.acme-internal.io matches ONLY that exact host
+#   10.0.0.0/8          CIDR — matches any IP in 10.0.0.0/8
+#   192.168.1.5         single IP
+#
+# Deny-wins: if a host matches BOTH in_scope and out_of_scope, it is rejected.
+# This matches HackerOne / Bugcrowd policy semantics.
+#
+# automation_allowed: false → every tool refuses to fire (some bug bounty
+# programs prohibit automated scanning entirely — check the policy first).
+
+program: example-program
+in_scope:
+  - "*.example.com"
+  - "api.example-internal.io"
+out_of_scope:
+  - "blog.example.com"        # third-party hosted, excluded by policy
+  - "status.example.com"      # StatusPage.io — third-party
+rate_limit:
+  max_rps: 5                  # respect program-stated limits
+  max_concurrent: 10
+automation_allowed: true

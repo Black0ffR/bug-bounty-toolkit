@@ -145,6 +145,28 @@ CREATE TABLE IF NOT EXISTS triage_decisions (
 CREATE INDEX IF NOT EXISTS idx_td_finding   ON triage_decisions(finding_id);
 """
 
+# Current schema version. Bump and add a MIGRATION entry whenever the schema
+# changes, so existing pipeline_state.db files migrate forward instead of
+# erroring out on a missing column.
+SCHEMA_VERSION = 1
+
+SCHEMA_META_SQL = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+# version N -> list of DDL statements applied when migrating from N-1 to N.
+# Each statement is wrapped in try/except so a partially-applied/crash-safe
+# migration never bricks the DB (idempotent-friendly: re-running a skipped
+# migration on a corrupted meta row degrades to a logged warning).
+MIGRATIONS: dict[int, list[str]] = {
+    1: [
+        "ALTER TABLE findings_history ADD COLUMN tags TEXT",
+    ],
+}
+
 
 @dataclass
 class AssetDiff:
@@ -168,7 +190,45 @@ class PipelineState:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
+            self._conn.executescript(SCHEMA_META_SQL)
             self._conn.commit()
+            self._migrate()
+
+    def _get_schema_version(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'version'"
+        ).fetchone()
+        if not row:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def _set_schema_version(self, version: int) -> None:
+        self._conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES('version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(version),),
+        )
+        self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Apply any pending migrations forward to SCHEMA_VERSION."""
+        current = self._get_schema_version()
+        while current < SCHEMA_VERSION:
+            next_ver = current + 1
+            for stmt in MIGRATIONS.get(next_ver, []):
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.Error as exc:
+                    log.warning("pipeline_state migration v%d failed (%s): %s",
+                                next_ver, stmt, exc)
+            self._conn.commit()
+            self._set_schema_version(next_ver)
+            current = next_ver
+        if self._get_schema_version() != SCHEMA_VERSION:
+            self._set_schema_version(SCHEMA_VERSION)
 
     def close(self) -> None:
         with self._lock:

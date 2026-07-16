@@ -133,3 +133,26 @@ def test_get_findings_by_host(temp_db):
     h1 = temp_db.get_findings_by_host("host1.com")
     assert len(h1) == 1
     assert h1[0]["id"] == "h1"
+
+
+def test_migrate_from_v0_adds_column(tmp_path):
+    db = tmp_path / "ps.db"
+    # Build a v0 database: base schema + schema_meta pinned at version 0,
+    # but WITHOUT the v1 'tags' column.
+    import sqlite3 as _sql
+
+    from toolkit.infra import pipeline_state as psmod
+    conn = _sql.connect(str(db))
+    conn.executescript(psmod.SCHEMA_SQL)
+    conn.executescript(psmod.SCHEMA_META_SQL)
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES('version', '0')")
+    conn.commit()
+    conn.close()
+
+    # Reopen → should migrate v0 -> v1 and add the 'tags' column.
+    state = psmod.PipelineState(db)
+    cols = {r["name"] for r in state._conn.execute(
+        "PRAGMA table_info(findings_history)")}
+    assert "tags" in cols
+    assert state._get_schema_version() == psmod.SCHEMA_VERSION
+    state.close()

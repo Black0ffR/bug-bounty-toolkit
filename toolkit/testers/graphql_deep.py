@@ -57,6 +57,7 @@ import json
 import logging
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -250,39 +251,111 @@ async def test_batch_bypass(client, endpoint: str, *,
     })
 
 
+def _unwrap_type(t: Any) -> str | None:
+    """Walk NON_NULL/LIST wrappers to the named underlying type."""
+    while isinstance(t, dict) and t.get("ofType"):
+        t = t["ofType"]
+    return t.get("name") if isinstance(t, dict) else None
+
+
+def _object_field_map(schema: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    """name -> {field_name: return_type_name} for OBJECT types (excludes __ introspection)."""
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(schema, dict):
+        return out
+    for t in schema.get("types", []) or []:
+        if not isinstance(t, dict):
+            continue
+        if t.get("kind") != "OBJECT" or str(t.get("name", "")).startswith("__"):
+            continue
+        fields: dict[str, str] = {}
+        for f in t.get("fields", []) or []:
+            rt = _unwrap_type(f.get("type"))
+            if rt:
+                fields[str(f.get("name"))] = rt
+        out[str(t["name"])] = fields
+    return out
+
+
+def _find_recursive_chain(schema: dict[str, Any] | None, max_len: int = 6) -> list[str]:
+    """Find a field chain from Query that loops back on a type, so a valid
+    recursive nested query can be built for the depth-DoS probe.
+
+    Returns e.g. ``["user", "friends"]`` (Query.user → User.friends → User),
+    or a 2-step object path as a fallback, or ``[]`` if no recursion is found.
+    """
+    fmap = _object_field_map(schema)
+    query_name = (schema or {}).get("queryType") or {}
+    query_name = query_name.get("name") if isinstance(query_name, dict) else "Query"
+    if query_name not in fmap:
+        return []
+
+    def dfs(typ: str, chain: list[str], seen: set[str]) -> list[str] | None:
+        for fld, rt in fmap.get(typ, {}).items():
+            if rt in seen:
+                return chain + [fld]  # closing the cycle
+            if rt in fmap and len(chain) < max_len:
+                res = dfs(rt, chain + [fld], seen | {rt})
+                if res:
+                    return res
+        return None
+
+    res = dfs(query_name, [], {query_name})
+    if res:
+        return res
+    # Fallback: any 2-step object→object path from Query
+    for fld, rt in fmap.get(query_name, {}).items():
+        for fld2 in fmap.get(rt, {}):
+            return [fld, fld2]
+    return []
+
+
+def _build_depth_query(chain: list[str], depth: int) -> str:
+    """Build a syntactically valid nested query of `depth` levels following the
+    recursive `chain` (cycled as needed). Returns ``"{}"`` if no chain given."""
+    if not chain:
+        return "{}"
+    parts = [chain[i % len(chain)] for i in range(depth)]
+    q = parts[0]
+    for f in parts[1:]:
+        q = f"{f} {{ {q} }}"
+    return "{" + q + "}"
+
+
 async def test_depth_dos(client, endpoint: str, *,
                          max_depth: int = 50,
-                         step: int = 5) -> tuple[int, float, bool]:
-    """Send nested queries at increasing depth. Returns (max_successful_depth, elapsed_at_max, timed_out_at_higher_depth).
-    A depth-50 success in < 5s suggests no depth limit → DoS candidate."""
-    # We need a recursive type. __typename doesn't recurse. Use a synthetic
-    # nested-self-reference via a query that nests __typename under itself —
-    # this won't work on most schemas, so we try a few common patterns.
-    # The most universal is asking for __typename nested under a known field.
-    # Since we don't know the schema, just send increasing-depth queries on
-    # __typename — most servers will reject depth-1 already, but if they
-    # accept depth-50, that's suspicious.
+                         step: int = 5,
+                         schema: dict[str, Any] | None = None) -> tuple[int, float, bool]:
+    """Send schema-aware nested queries at increasing depth. Returns
+    (max_successful_depth, elapsed_at_max, timed_out_at_higher_depth).
+    A depth-50 success in < 5s suggests no depth limit → DoS candidate.
+
+    The nested query follows a real recursive field chain from the schema
+    (e.g. ``Query.user → User.friends → User``) so the probe is a *valid*
+    GraphQL document the server can actually execute — the previous probe
+    nested ``__typename`` under itself, which is invalid and got rejected by
+    every server, so the depth-DoS check silently never fired.
+    """
+    chain = _find_recursive_chain(schema)
+    if not chain:
+        # Without a schema we cannot build a valid recursive query, so probing
+        # would be meaningless. Bail out honestly instead of sending an invalid
+        # document that every server rejects.
+        if schema is not None:
+            log.warning("test_depth_dos: no recursive field chain found in schema — skipping")
+        return (0, 0.0, False)
     last_success_depth = 0
     last_success_elapsed = 0.0
     timed_out = False
     for depth in range(step, max_depth + 1, step):
-        # Build a nested query of arbitrary field at the requested depth
-        # Use a query that nests a self-referencing type. If the server has
-        # any recursive type (User → friends → User → friends ...), this will work.
-        # We use __typename at every level — most permissive.
-        inner = "__typename"
-        for _ in range(depth):
-            inner = f"__typename {{ {inner} }}"
-        query = f"{{ {inner} }}"
-        import time
+        query = _build_depth_query(chain, depth)
         t0 = time.perf_counter()
         status, j, text = await _post_query(client, endpoint, query)
         elapsed = time.perf_counter() - t0
         if status == 0:
             timed_out = True
             break
-        # Check if there were depth-related errors
-        errors = j.get("errors") or []
+        errors = (j or {}).get("errors") or [] if isinstance(j, dict) else []
         err_str = json.dumps(errors).lower()
         if "depth" in err_str or "too deep" in err_str:
             # Depth limit enforced — good
@@ -404,7 +477,9 @@ async def scan_endpoint(endpoint: str, guard: scope_guard.ScopeGuard) -> list[Gq
         if not guard.acquire_token(timeout=30.0):
             return findings
         try:
-            max_depth, elapsed, timed_out = await test_depth_dos(client, endpoint, max_depth=50, step=5)
+            max_depth, elapsed, timed_out = await test_depth_dos(
+                client, endpoint, max_depth=50, step=5, schema=schema
+            )
         finally:
             guard.release_token()
         if max_depth >= 20 and elapsed < 5.0 and not timed_out:

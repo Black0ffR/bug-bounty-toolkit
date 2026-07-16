@@ -15,6 +15,7 @@ from toolkit.verify.idor_crosssession import (
     _build_url_with_id,
     build_verified_findings,
     ReplayResult,
+    _sweep_blast_radius,
 )
 from toolkit.infra import scope_guard
 from toolkit.infra.auth_profiles import AuthProfiles
@@ -259,3 +260,42 @@ def test_verify_finding_access_controlled(mock_http_server, temp_scope_yaml, tem
     assert result is not None
     assert result.verdict == "access_controlled"
     assert result.user_b_status == 403
+
+
+def test_sweep_blast_radius_concurrent(mock_http_server, temp_scope_yaml):
+    """Neighbors that resolve under user_b are counted; sweep runs concurrently
+    (all reachable neighbors resolve, not just the first)."""
+    import asyncio
+    import httpx
+
+    from toolkit.infra import scope_guard
+
+    base_url, server = mock_http_server
+    long_body = '{"id": 1, "name": "Alice", "email": "alice@example.com", "x": "y"}'
+    # Neighbors of id "1": -1, 0, 2, 3, 6 (gen_neighbor_ids count=5). Make all resolve.
+    server.routes = {
+        (method, f"{path}"): {
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": long_body,
+        }
+        for method, path in [
+            ("GET", "/api/users/-1"),
+            ("GET", "/api/users/0"),
+            ("GET", "/api/users/2"),
+            ("GET", "/api/users/3"),
+            ("GET", "/api/users/6"),
+        ]
+    }
+    guard = scope_guard.ScopeGuard(temp_scope_yaml)
+    neighbors = ["-1", "0", "2", "3", "6"]
+    headers = {"Cookie": "session=user-b"}
+
+    async def _run() -> int:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=False) as client:
+            return await _sweep_blast_radius(
+                client, guard, headers,
+                f"{base_url}/api/users/1", "1", neighbors, concurrency=5,
+            )
+
+    assert asyncio.run(_run()) == 5

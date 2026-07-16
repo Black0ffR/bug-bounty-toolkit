@@ -354,7 +354,7 @@ async def verify_finding(finding: dict[str, Any], profiles: AuthProfiles,
     elif s_b == 0:
         verdict = "inconclusive"
         evidence_parts.append("(user_b request failed)")
-    # Blast radius sweep for confirmed IDORs only
+    # Blast radius sweep for confirmed IDORs only (concurrent)
     blast = 0
     if verdict == "confirmed":
         # Extract current ID from URL
@@ -363,26 +363,12 @@ async def verify_finding(finding: dict[str, Any], profiles: AuthProfiles,
             current_id = m.group(1)
             neighbors = gen_neighbor_ids(current_id, count=max_blast)
             log.info("sweeping %d neighbor IDs for blast radius", len(neighbors))
-            for nid in neighbors:
-                if nid == current_id:
-                    continue
-                test_url = _build_url_with_id(parsed["url"], nid)
-                try:
-                    guard.check_url(test_url, source_tool="idor_crosssession.py")
-                except scope_guard.ScopeError:
-                    continue
-                if not guard.acquire_token(timeout=20.0):
-                    continue
-                try:
-                    async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=False) as client:
-                        s_n, body_n, len_n = await _replay_with_client(
-                            client, "GET", test_url, merged_b, None
-                        )
-                finally:
-                    guard.release_token()
-                if s_n in (200, 201) and len_n > 50:
-                    blast += 1
-                    evidence_parts.append(f"  neighbor {nid}: HTTP {s_n} {len_n}B — RESOLVES")
+            blast = await _sweep_blast_radius(
+                client, guard, merged_b, parsed["url"], current_id, neighbors
+            )
+            evidence_parts.append(
+                f"blast_radius sweep: {blast}/{len(neighbors)} neighbor IDs resolved under user_b"
+            )
     return ReplayResult(
         finding_id=fid,
         user_a_status=s_a, user_a_body_len=len_a, user_a_body_hash=h_a,
@@ -393,8 +379,44 @@ async def verify_finding(finding: dict[str, Any], profiles: AuthProfiles,
     )
 
 
+async def _sweep_blast_radius(client, guard: scope_guard.ScopeGuard,
+                               headers: dict[str, str], base_url: str,
+                               current_id: str, neighbors: list[str], *,
+                               concurrency: int = 5) -> int:
+    """Concurrently replay neighbor IDs and count how many resolve under user_b.
+
+    Replaces the previous sequential per-neighbor loop so a confirmed IDOR's
+    blast radius is estimated in parallel (bounded by `concurrency`), which
+    keeps the sweep fast even for wide windows.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _probe(nid: str) -> bool:
+        if nid == current_id:
+            return False
+        test_url = _build_url_with_id(base_url, nid)
+        try:
+            guard.check_url(test_url, source_tool="idor_crosssession.py")
+        except scope_guard.ScopeError:
+            return False
+        if not guard.acquire_token(timeout=20.0):
+            return False
+        try:
+            async with sem:
+                s_n, _body_n, len_n = await _replay_with_client(
+                    client, "GET", test_url, headers, None
+                )
+        finally:
+            guard.release_token()
+        return s_n in (200, 201) and len_n > 50
+
+    probes = await asyncio.gather(*[_probe(nid) for nid in neighbors],
+                                  return_exceptions=True)
+    return sum(1 for r in probes if r is True)
+
+
 async def _replay_with_client(client, method: str, url: str, headers: dict[str, str],
-                              body: Any) -> tuple[int, str, int]:
+                               body: Any) -> tuple[int, str, int]:
     """Adapter that calls the right method on an httpx.AsyncClient."""
     kwargs: dict[str, Any] = {"headers": headers}
     if body is not None:

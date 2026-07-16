@@ -136,8 +136,26 @@ def _subtakeover_scope_args(ctx: OrchestratorContext) -> list[str]:
 # output to ctx.stage_output(stage_name). On --resume, if the output exists,
 # the stage is skipped.
 
+# Repo root is the directory containing this file. Subtrees (toolkit/, scripts/,
+# oob_catcher/) live under it, so spawned subprocesses need it on PYTHONPATH.
+REPO_ROOT = Path(__file__).resolve().parent
+
 # Scripts directory is at the SubTakeover root (sibling of this file).
-SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Return an environment dict with REPO_ROOT prepended to PYTHONPATH.
+
+    Spawned scripts rely on importing sibling packages (``toolkit``,
+    ``oob_catcher``). Injecting the repo root makes those imports resolve even
+    when the orchestrator is launched from another working directory.
+    """
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    paths = [str(REPO_ROOT)] + ([existing] if existing else [])
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
 
 
 def _run_subprocess(cmd: list[str], *, timeout: int = 1800,
@@ -147,7 +165,7 @@ def _run_subprocess(cmd: list[str], *, timeout: int = 1800,
     try:
         p = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-            check=False,
+            check=False, env=_subprocess_env(),
         )
         return (p.returncode, p.stdout or "", p.stderr or "")
     except subprocess.TimeoutExpired:
@@ -687,6 +705,13 @@ def main() -> int:
     ap.add_argument("--apk-dir", help="path to apktool-decoded APK directory (enables apk_static stage)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    if not SCRIPTS_DIR.is_dir():
+        log.error(
+            "scripts/ directory not found at %s. Orchestrator must run from the "
+            "SubTakeover repo root, or SCRIPTS_DIR must be set.", REPO_ROOT,
+        )
+        return 2
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

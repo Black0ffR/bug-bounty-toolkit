@@ -146,9 +146,12 @@ class AnomalyDetector:
                         n, self.min_samples)
         if n > 0:
             self._timing_mean = statistics.fmean(self._baseline_timings)
-            self._timing_stdev = statistics.pstdev(self._baseline_timings) if n > 1 else 0.0
+            # Sample standard deviation (stdev), not population (pstdev): the
+            # baseline is a *sample* of observations, so pstdev underestimates
+            # variance and inflates z-scores → false anomalies. stdev is correct.
+            self._timing_stdev = statistics.stdev(self._baseline_timings) if n > 1 else 0.0
             self._size_mean = statistics.fmean(self._baseline_sizes)
-            self._size_stdev = statistics.pstdev(self._baseline_sizes) if n > 1 else 0.0
+            self._size_stdev = statistics.stdev(self._baseline_sizes) if n > 1 else 0.0
         self._calibrated = True
         log.info("baseline calibrated: n=%d timing=%.1fms±%.1f size=%.0f±%.0f statuses=%s headers=%d",
                  n, self._timing_mean, self._timing_stdev, self._size_mean, self._size_stdev,

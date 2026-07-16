@@ -156,3 +156,15 @@ def test_normalize_falls_back_for_unknown_shape():
     assert n["vuln_class_key"] == "UNKNOWN"
     assert n["confidence"] == "candidate"
     assert n["source_tool"] == "unknown_tool"
+
+
+def test_invalid_confidence_defaults():
+    n = normalize_finding_dict({"host": "h", "url": "u", "vuln_class_key": "X",
+                                 "severity": "HIGH", "title": "t", "confidence": "candidtae"})
+    assert n["confidence"] == "candidate"
+
+
+def test_invalid_disposition_defaults():
+    n = normalize_finding_dict({"host": "h", "url": "u", "vuln_class_key": "X",
+                                 "severity": "HIGH", "title": "t", "disposition": "submited"})
+    assert n["disposition"] == "new"

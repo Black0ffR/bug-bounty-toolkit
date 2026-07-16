@@ -46,9 +46,17 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+_ALLOWED_CONFIDENCE = {"candidate", "probable", "confirmed"}
+_ALLOWED_DISPOSITION = {"new", "reviewed", "submitted", "rejected", "duplicate_of"}
+_DEFAULT_CONFIDENCE = "candidate"
+_DEFAULT_DISPOSITION = "new"
 
 
 # Volatile fragments that routinely differ run-to-run for the *same* logical
@@ -195,7 +203,7 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
                 out.get("vuln_class_key", ""), out.get("evidence", ""),
                 url=out.get("url", ""), param_name=out.get("param_name", ""),
             )
-        return out
+        return _clamp_enums(out)
 
     # apifuzz.py finding
     if "test_type" in d and "host" in d:
@@ -356,7 +364,29 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
     return _fill_defaults(out)
 
 
+def _clamp_enums(d: dict[str, Any]) -> dict[str, Any]:
+    """Clamp confidence/disposition to the allowed sets; warn + default otherwise.
+
+    Invalid enums previously passed through silently and corrupted downstream
+    triage filters and pipeline_state dedup keys.
+    """
+    conf = d.get("confidence")
+    if conf not in _ALLOWED_CONFIDENCE:
+        if conf is not None:
+            log.warning("normalize_finding_dict: invalid confidence %r; defaulting to %r",
+                        conf, _DEFAULT_CONFIDENCE)
+        d["confidence"] = _DEFAULT_CONFIDENCE
+    disp = d.get("disposition")
+    if disp not in _ALLOWED_DISPOSITION:
+        if disp is not None:
+            log.warning("normalize_finding_dict: invalid disposition %r; defaulting to %r",
+                        disp, _DEFAULT_DISPOSITION)
+        d["disposition"] = _DEFAULT_DISPOSITION
+    return d
+
+
 def _fill_defaults(d: dict[str, Any]) -> dict[str, Any]:
+    _clamp_enums(d)
     d.setdefault("disposition", "new")
     d.setdefault("first_seen", _utcnow_iso())
     d.setdefault("last_seen", _utcnow_iso())

@@ -137,8 +137,12 @@ def _looks_like_placeholder(value: str) -> bool:
     if v in _PLACEHOLDERS:
         return True
     low = v.lower()
-    if any(p in low for p in ("example", "testtest", "placeholder", "your_key", "yourkey",
-                              "xxxxxx", "1234567890", "0000000000")):
+    # Only flag clear placeholder tokens. Numeric runs (1234567890 / 0000000000)
+    # were previously matched as substrings but occur in legitimate high-entropy
+    # keys, producing false "dead/placeholder" dispositions. `testtest` is kept
+    # because provider docs use it verbatim (e.g. ghp_testtest...).
+    if any(p in low for p in ("example", "testtest", "placeholder", "your_key",
+                              "yourkey", "xxxxxx", "changeme")):
         return True
     return False
 

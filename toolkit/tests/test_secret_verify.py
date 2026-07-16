@@ -62,6 +62,15 @@ def test_placeholder_detection():
     assert not _looks_like_placeholder(TEST_PAT_A)  # aaaa has no placeholder markers
 
 
+def test_placeholder_no_false_positive_on_real_looking_keys():
+    """High-entropy keys that merely contain a digit run must NOT be flagged as
+    placeholders (previously '1234567890'/'0000000000' matched as substrings)."""
+    assert not _looks_like_placeholder("sk_live_abc1234567890defGHI")
+    assert not _looks_like_placeholder("AKIAIOSFODNN7REALKEY0000000000")
+    assert not _looks_like_placeholder("AIzaSyA1234567890abcdefghijKLM")
+    assert _looks_like_placeholder("changeme_please")  # real placeholder token
+
+
 def test_redact_short_value():
     assert _redact("abc") == "***"
 

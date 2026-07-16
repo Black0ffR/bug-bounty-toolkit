@@ -62,6 +62,7 @@ License : MIT (for authorized use only)
 from __future__ import annotations
 
 import datetime
+import fcntl
 import ipaddress
 import json
 import logging
@@ -87,8 +88,85 @@ except ImportError:
 log = logging.getLogger("scope_guard")
 
 
+def _default_slot_dir() -> Path:
+    """Directory for cross-process concurrency lock slots (Termux: $TMPDIR)."""
+    base = os.environ.get("TMPDIR") or "/tmp"
+    return Path(base) / "scope_guard.slots"
+
+
 class ScopeError(RuntimeError):
     """Raised when a target is out of scope or scope config is invalid."""
+
+
+class _CrossProcessGate:
+    """Bounded-concurrency gate shared across processes via flock.
+
+    The limiter must cap *total* in-flight requests across all the tools the
+    orchestrator spawns (11+ subprocesses), not just within one interpreter.
+    This gate enforces ``max_concurrent`` process-wide using advisory locks
+    (``fcntl.flock``) on a pool of per-slot lock files.
+
+    Crash-safe by design: flock is released automatically when a process (or
+    thread) dies, so a dead tool cannot permanently hold a slot. Each acquire
+    opens a fresh fd for the slot it wins and keeps *all* won fds alive in a
+    set until explicitly released, so a caller that holds several slots
+    simultaneously (e.g. a test, or interleaved coroutines) does not lose the
+    underlying lock when a later acquire overwrites the "current" handle.
+    """
+
+    def __init__(self, max_concurrent: int, slot_dir: str | Path) -> None:
+        self.max = max(1, int(max_concurrent))
+        self.slot_dir = Path(slot_dir)
+        self._held: set = set()
+        self._lock = threading.Lock()
+        try:
+            self.slot_dir.mkdir(parents=True, exist_ok=True)
+            self._available = True
+        except OSError as exc:
+            log.warning("cross-process gate unavailable (%s) — no shared limiting", exc)
+            self._available = False
+
+    def _slot_path(self, i: int) -> Path:
+        return self.slot_dir / f"slot_{i}.lock"
+
+    def acquire(self, timeout: float = 60.0):
+        """Try to win a concurrency slot. Returns the held file object (truthy)
+        on success, or None on timeout / when the gate is unavailable."""
+        if not self._available:
+            return object()  # truthy sentinel: no shared limiting
+        deadline = time.monotonic() + timeout
+        while True:
+            for i in range(self.max):
+                try:
+                    fh = open(self._slot_path(i), "a+")
+                except OSError:
+                    continue
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    fh.close()
+                    continue
+                with self._lock:
+                    self._held.add(fh)
+                return fh
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.02, remaining))
+
+    def release(self, fh) -> None:
+        if fh is None:
+            return
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
+        with self._lock:
+            self._held.discard(fh)
 
 
 @dataclass
@@ -96,12 +174,13 @@ class _RateLimit:
     max_rps: float = 5.0
     max_concurrent: int = 10
 
-    # Token-bucket state
+    # Token-bucket state (per-process rps)
     _tokens: float = field(default=0.0, init=False)
     _last_refill: float = field(default=0.0, init=False)
-    _inflight: int = field(default=0, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-    _cond: threading.Condition = field(default_factory=lambda: threading.Condition(threading.Lock()), init=False)
+    # Cross-process concurrency gate (shared across all spawned tool processes)
+    gate: "_CrossProcessGate | None" = field(default=None, init=False)
+    _gate_held: Any = field(default=None, init=False)
 
     def init(self) -> None:
         """Prime the bucket to full on first use."""
@@ -111,19 +190,20 @@ class _RateLimit:
                 self._last_refill = time.monotonic()
 
     def acquire(self, timeout: float = 60.0) -> bool:
-        """Block until a request slot is free AND a token is available.
-        Returns True if acquired, False on timeout."""
+        """Block until a cross-process concurrency slot is free AND a token is
+        available. Returns True if acquired, False on timeout."""
         self.init()
         deadline = time.monotonic() + timeout
-        # Concurrency slot
-        with self._cond:
-            while self._inflight >= self.max_concurrent:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._cond.wait(timeout=remaining)
-            self._inflight += 1
-        # Token
+        # Cross-process concurrency slot (crash-safe flock)
+        if self.gate is not None:
+            gate_timeout = deadline - time.monotonic()
+            if gate_timeout <= 0:
+                return False
+            held = self.gate.acquire(gate_timeout)
+            if not held:
+                return False
+            self._gate_held = held
+        # Token (per-process rps)
         with self._lock:
             while True:
                 now = time.monotonic()
@@ -136,19 +216,16 @@ class _RateLimit:
                 needed = (1.0 - self._tokens) / self.max_rps
                 remaining = deadline - now
                 if remaining <= needed:
-                    # Release concurrency slot on failure
-                    with self._cond:
-                        self._inflight -= 1
-                        self._cond.notify()
+                    if self.gate is not None and self._gate_held is not None:
+                        self.gate.release(self._gate_held)
+                        self._gate_held = None
                     return False
-                # Sleep outside lock would lose token; sleep inside lock is OK
-                # because the lock is only held briefly. Use a short wait.
-                time.sleep(min(needed, 0.05))
+                time.sleep(min(needed, 0.05, max(0.0, remaining)))
 
     def release(self) -> None:
-        with self._cond:
-            self._inflight = max(0, self._inflight - 1)
-            self._cond.notify()
+        if self.gate is not None and self._gate_held is not None:
+            self.gate.release(self._gate_held)
+            self._gate_held = None
 
 
 class ScopeGuard:
@@ -164,6 +241,12 @@ class ScopeGuard:
         self._compiled_in: list[tuple[re.Pattern, ipaddress.IPv4Network | ipaddress.IPv6Network | None]] = []
         self._compiled_out: list[tuple[re.Pattern, ipaddress.IPv4Network | ipaddress.IPv6Network | None]] = []
         self._blocked_log: Path | None = None
+        # Cross-process concurrency gate (shared across spawned tool processes).
+        # Default slot dir; narrowed to a per-scope dir in _load() when a scope
+        # file is present so independent scopes don't share the global budget.
+        self.rate_limit.gate = _CrossProcessGate(
+            self.rate_limit.max_concurrent, _default_slot_dir()
+        )
         if self.path:
             self._load()
 
@@ -190,6 +273,12 @@ class ScopeGuard:
         rl = data.get("rate_limit", {}) or {}
         self.rate_limit.max_rps = float(rl.get("max_rps", 5.0))
         self.rate_limit.max_concurrent = int(rl.get("max_concurrent", 10))
+        # Rebuild the cross-process gate keyed to this scope's directory so two
+        # unrelated scopes don't share the same concurrency budget.
+        if self.path is not None:
+            self.rate_limit.gate = _CrossProcessGate(
+                self.rate_limit.max_concurrent, self.path.parent / ".scope_guard_slots"
+            )
         self.automation_allowed = bool(data.get("automation_allowed", True))
         self._compiled_in = [self._compile(x) for x in self.in_scope]
         self._compiled_out = [self._compile(x) for x in self.out_of_scope]

@@ -7,6 +7,7 @@ from toolkit.infra.scope_guard import (
     ScopeGuard,
     ScopeError,
     _fallback_yaml_parse,
+    _CrossProcessGate,
     configure,
     get_default,
     check_scope as default_check_scope,
@@ -198,3 +199,21 @@ def test_request_slot_context_manager(tmp_path):
     with pytest.raises(ScopeError):
         with g.request_slot("evil.com", source_tool="test"):
             pass
+
+
+def test_cross_process_gate_limits_concurrency(tmp_path):
+    """The gate must refuse a slot once max_concurrent are held, even within a
+    single process (which exercises the flock path on a fresh fd per acquire)."""
+    import time
+
+    gate = _CrossProcessGate(2, tmp_path / "slots")
+    fh1 = gate.acquire(timeout=1.0)
+    assert fh1 is not None
+    fh2 = gate.acquire(timeout=1.0)
+    assert fh2 is not None
+    # Third acquire should time out — both slots are held.
+    assert gate.acquire(timeout=0.2) is None
+    # Releasing one frees a slot.
+    gate.release(fh2)
+    assert gate.acquire(timeout=1.0) is not None
+    gate.release(fh1)

@@ -46,8 +46,31 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+# Volatile fragments that routinely differ run-to-run for the *same* logical
+# finding: long numeric runs (status codes, byte sizes, durations, timestamps),
+# long hex blobs (response ids, hashes), and URLs (which embed random paths).
+_VOLATILE_EVIDENCE_RE = re.compile(
+    r"https?://[^\s'\"]+|0x[0-9a-fA-F]+|\b[0-9a-fA-F]{12,}\b|\b[0-9]{3,}\b"
+)
+
+
+def _canonicalize_evidence(evidence: str) -> str:
+    """Strip run-to-run noise from evidence so identical findings dedupe.
+
+    Short tokens (e.g. ``ev1`` vs ``ev2``) keep their digits and stay distinct,
+    preserving tool-level identity semantics, while 3+ digit numbers, long hex
+    and URLs are collapsed so response snippets and timestamps don't mint new
+    ids on every scan.
+    """
+    if not evidence:
+        return ""
+    normalized = _VOLATILE_EVIDENCE_RE.sub(" ", evidence)
+    return re.sub(r"\s+", " ", normalized).strip().lower()
 
 
 def _utcnow_iso() -> str:
@@ -109,14 +132,26 @@ class NormalizedFinding:
 
 
 def compute_finding_id(source_tool: str, host: str, vuln_class_key: str,
-                       evidence: str) -> str:
-    """sha256(source_tool+host+vuln_class_key+evidence) truncated to 16 hex chars.
-    Stable across runs, so the same finding emitted by the same tool on the same
-    host gets the same id — enabling cross-run dedup via pipeline_state.db."""
-    h = hashlib.sha256(
-        f"{source_tool}|{host}|{vuln_class_key}|{evidence}".encode("utf-8")
-    ).hexdigest()
-    return h[:16]
+                       evidence: str, *, url: str = "", param_name: str = "") -> str:
+    """sha256 of the *stable* identity of a finding, truncated to 16 hex chars.
+
+    Identity is built from source_tool + host + vuln_class_key + url + param_name
+    plus a canonicalized (noise-stripped) form of ``evidence``. Volatile fragments
+    of evidence (status codes, byte sizes, timestamps, long hex, URLs) are
+    collapsed so the same logical finding emitted by the same tool on the same
+    host keeps the same id across runs — enabling cross-run dedup via
+    pipeline_state.db. url/param_name further disambiguate multiple findings on
+    one host+class (e.g. BOLA across distinct endpoints/params).
+    """
+    key = "|".join([
+        (source_tool or "").lower(),
+        (host or "").lower(),
+        (vuln_class_key or "").lower(),
+        (url or "").lower(),
+        (param_name or "").lower(),
+        _canonicalize_evidence(evidence),
+    ])
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[str, Any]:
@@ -158,6 +193,7 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
             out["id"] = compute_finding_id(
                 out.get("source_tool", ""), out.get("host", ""),
                 out.get("vuln_class_key", ""), out.get("evidence", ""),
+                url=out.get("url", ""), param_name=out.get("param_name", ""),
             )
         return out
 
@@ -193,13 +229,16 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
                       "response_snippet": d.get("response_snippet", "")}
         out["confidence"] = "candidate"
         out["id"] = compute_finding_id(out["source_tool"], out["host"],
-                                        out["vuln_class_key"], out["evidence"])
+                                        out["vuln_class_key"], out["evidence"],
+                                        url=out.get("url", ""),
+                                        param_name=out.get("param_name", ""))
         return _fill_defaults(out)
 
     # paramfuzz.py finding
     if "finding_type" in d and "param_name" in d:
         out["host"] = d.get("host", "")
         out["url"] = d.get("url", "")
+        out["param_name"] = d.get("param_name", "")
         out["severity"] = (d.get("severity") or "INFO").upper()
         out["title"] = d.get("title", "")
         out["detail"] = d.get("detail", "")
@@ -223,7 +262,9 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
                       "method": d.get("method", "")}
         out["confidence"] = "candidate"
         out["id"] = compute_finding_id(out["source_tool"], out["host"],
-                                        out["vuln_class_key"], out["evidence"])
+                                        out["vuln_class_key"], out["evidence"],
+                                        url=out.get("url", ""),
+                                        param_name=out.get("param_name", ""))
         return _fill_defaults(out)
 
     # ssrfprobe.py finding
@@ -250,7 +291,9 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
                       "is_reflective": d.get("is_reflective", False)}
         out["confidence"] = "probable" if d.get("is_blind") else "candidate"
         out["id"] = compute_finding_id(out["source_tool"], out["host"],
-                                        out["vuln_class_key"], out["evidence"])
+                                        out["vuln_class_key"], out["evidence"],
+                                        url=out.get("url", ""),
+                                        param_name=out.get("param_name", ""))
         return _fill_defaults(out)
 
     # subtakeover.py finding
@@ -271,7 +314,9 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
                       "http_status": d.get("http_status")}
         out["confidence"] = "candidate"
         out["id"] = compute_finding_id(out["source_tool"], out["host"],
-                                        out["vuln_class_key"], out["evidence"])
+                                        out["vuln_class_key"], out["evidence"],
+                                        url=out.get("url", ""),
+                                        param_name=out.get("param_name", ""))
         return _fill_defaults(out)
 
     # jsreaper.py secret
@@ -291,7 +336,9 @@ def normalize_finding_dict(d: dict[str, Any], *, source_tool: str = "") -> dict[
         jc = (d.get("confidence") or "").upper()
         out["confidence"] = {"HIGH": "probable", "MEDIUM": "candidate", "LOW": "candidate"}.get(jc, "candidate")
         out["id"] = compute_finding_id(out["source_tool"], out["host"],
-                                        out["vuln_class_key"], out["evidence"])
+                                        out["vuln_class_key"], out["evidence"],
+                                        url=out.get("url", ""),
+                                        param_name=out.get("param_name", ""))
         return _fill_defaults(out)
 
     # Fallback: pass through what we can

@@ -473,6 +473,10 @@ class NormalizedFinding:
     verified_by: str | None = None       # tool name if a Layer 4 verifier confirmed it
 
 
+# Field names accepted when ingesting a toolkit-normalized finding dict.
+_NH_FIELDS = set(NormalizedFinding.__dataclass_fields__.keys())
+
+
 @dataclass
 class ChainFinding:
     """A combined critical finding formed by chaining two or more findings."""
@@ -758,6 +762,41 @@ def parse_paramfuzz(path: str) -> list[NormalizedFinding]:
             fi.get("curl_command",""), raw=fi,
         ))
     log.info(f"[Parse] paramfuzz: {len(findings)} findings")
+    return findings
+
+
+def parse_normalized_json(path: str) -> list[NormalizedFinding]:
+    """Ingest findings emitted by the new toolkit stages (Layer 4 verify/
+    testers tools) which already use the canonical NormalizedFinding shape.
+
+    Accepts either ``{"findings": [...]}`` or a bare JSON list. Each item must
+    carry a ``vuln_class_key`` plus a ``host`` or ``url`` to be counted; items
+    without those (e.g. raw recon blobs) are skipped so they don't pollute the
+    aggregated report. This is the missing link that lets secret_verify,
+    idor_crosssession, xss_context, graphql_deep, spa_router, upload_probe and
+    apk_static findings reach aggregation and triage.
+    """
+    findings: list[NormalizedFinding] = []
+    with open(path) as f:
+        data = json.load(f)
+    items = data.get("findings", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return findings
+    for fi in items:
+        if not isinstance(fi, dict):
+            continue
+        if not fi.get("vuln_class_key"):
+            continue
+        if not (fi.get("host") or fi.get("url")):
+            continue
+        clean = {k: v for k, v in fi.items() if k in _NH_FIELDS}
+        # Toolkit-normalized dicts may omit fields that are required positionals
+        # in this dataclass (no defaults) — backfill so ingestion never crashes.
+        clean.setdefault("steps_to_reproduce", "")
+        clean.setdefault("remediation", "")
+        findings.append(NormalizedFinding(**clean))
+    if findings:
+        log.info(f"[Parse] normalized ({Path(path).name}): {len(findings)} findings")
     return findings
 
 
@@ -1767,6 +1806,25 @@ async def main() -> None:
                 source_tools.append(tool_name)
         except Exception as exc:
             log.warning(f"[{tool_name}] Parse error: {exc}")
+
+    # Ingestion of new-stage (Layer 4 verify/testers) normalized findings.
+    # These tools already emit canonical NormalizedFinding JSON; the auto-discover
+    # globs above only match legacy tool filenames, so scan every *.json in the
+    # --all-findings directory that wasn't already consumed by a legacy parser.
+    consumed = {str(Path(p).resolve()) for p, _ in parsers.values() if p}
+    output_json = str(Path(args.output).resolve().with_suffix(".json"))
+    if args.all_findings:
+        for jf in sorted(Path(args.all_findings).glob("*.json")):
+            rp = str(jf.resolve())
+            if rp in consumed or rp == output_json:
+                continue
+            try:
+                nh_findings = parse_normalized_json(str(jf))
+                if nh_findings:
+                    all_findings.extend(nh_findings)
+                    source_tools.append(f"normalized:{jf.stem}")
+            except Exception as exc:
+                log.debug(f"[normalized] skip {jf.name}: {exc}")
 
     # Run Nuclei if requested
     nuclei_raw: list[dict] = []

@@ -98,6 +98,39 @@ class OrchestratorContext:
         return self.work_dir / f"{stage_name}{suffix}"
 
 
+def _subtakeover_scope_args(ctx: OrchestratorContext) -> list[str]:
+    """Build the --scope arg for subtakeover10.py with the correct format.
+
+    subtakeover10.py's ScopeFilter expects a flat HackerOne/Bugcrowd file
+    (``*.host.com`` / ``!host.com``), but the toolkit's scope.yaml is a
+    structured document (``in_scope:`` / ``out_of_scope:``). Handing the
+    structured file over directly makes ScopeFilter mis-parse every line, so
+    subtakeover would enforce the wrong (or no) scope. Convert the toolkit
+    scope to the flat format (cached in the workdir) when needed.
+    """
+    if not ctx.scope_path or not Path(ctx.scope_path).exists():
+        return []
+    text = Path(ctx.scope_path).read_text(encoding="utf-8")
+    # Already a flat HackerOne/Bugcrowd file? (no structured keys) -> pass through
+    if not any(k in text for k in ("in_scope:", "out_of_scope:", "program:")):
+        return ["--scope", str(ctx.scope_path)]
+    try:
+        data = scope_guard._fallback_yaml_parse(text)
+    except Exception:
+        return ["--scope", str(ctx.scope_path)]
+    lines: list[str] = []
+    for entry in data.get("in_scope", []) or []:
+        if isinstance(entry, str):
+            lines.append(entry.lstrip("!").lstrip("*."))
+    for entry in data.get("out_of_scope", []) or []:
+        if isinstance(entry, str):
+            lines.append("!" + entry.lstrip("!").lstrip("*."))
+    ctx.work_dir.mkdir(parents=True, exist_ok=True)
+    out_path = ctx.work_dir / "subtakeover_scope.txt"
+    out_path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+    return ["--scope", str(out_path)]
+
+
 # ── Stage implementations ────────────────────────────────────────────────────
 # Each stage shells out to an existing script (in ../scripts/) and writes its
 # output to ctx.stage_output(stage_name). On --resume, if the output exists,
@@ -136,8 +169,7 @@ def _stage_subtakeover(ctx: OrchestratorContext) -> StageResult:
         "--ct", "--passive", "--cluster", "--ns-check", "--whois",
         "--permute", "--tls", "--assets",
     ]
-    if ctx.scope_path:
-        cmd += ["--scope", str(ctx.scope_path)]
+    cmd += _subtakeover_scope_args(ctx)
     rc, _, err = _run_subprocess(cmd, timeout=1800)
     return StageResult("subtakeover", rc == 0, out, err, time.time() - t0)
 
@@ -499,13 +531,12 @@ def _stage_nuclei_harvest(ctx: OrchestratorContext) -> StageResult:
         p = ctx.stage_output(stage_name).with_suffix(".json")
         if p.exists():
             cmd += [flag, str(p)]
-    # Also feed new toolkit outputs (nuclei-harvest will need to be patched to accept these)
-    for stage_name in ("spa_router", "idor_crosssession", "secret_verify",
-                        "xss_context", "graphql_deep", "upload_probe", "apk_static"):
-        p = ctx.stage_output(stage_name).with_suffix(".json")
-        if p.exists():
-            # nuclei-harvest's --all-findings DIR mode will pick these up
-            pass
+    # New toolkit (Layer 4 verify/testers) stages emit canonical NormalizedFinding
+    # JSON. Feed the whole working directory so nuclei-harvest ingests every
+    # *-findings.json via its --all-findings normalized parser (secret_verify,
+    # idor_crosssession, xss_context, graphql_deep, spa_router, upload_probe,
+    # apk_static) in addition to the legacy per-tool flags above.
+    cmd += ["--all-findings", str(ctx.work_dir)]
     rc, _, err = _run_subprocess(cmd, timeout=600)
     return StageResult("nuclei-harvest", rc == 0, out, err, time.time() - t0)
 

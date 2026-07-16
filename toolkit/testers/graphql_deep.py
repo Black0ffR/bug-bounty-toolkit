@@ -430,7 +430,8 @@ def to_normalized(findings: list[GqlFinding]) -> list[dict[str, Any]]:
     for f in findings:
         host = urlparse(f.endpoint).hostname or ""
         evidence = f"{f.endpoint}|{f.test_type}|{f.evidence[:200]}"
-        fid = compute_finding_id("graphql_deep.py", host, "GQL_" + f.test_type.upper(), evidence)
+        fid = compute_finding_id("graphql_deep.py", host, "GQL_" + f.test_type.upper(),
+                                 evidence, url=f.endpoint)
         out.append({
             "id": fid,
             "source_tool": "graphql_deep.py",

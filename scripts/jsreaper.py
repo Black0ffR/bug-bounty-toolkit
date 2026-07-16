@@ -388,15 +388,25 @@ async def fetch(
     timeout: float = 15.0,
     client: "httpx.AsyncClient | None" = None,
     max_size_kb: int = 5000,
+    cookie: str | None = None,
+    extra_headers: dict | None = None,
 ) -> tuple[int | None, str, dict]:
     """
     GET url → (status, body_text, headers).
     Respects max_size_kb to avoid fetching huge vendor bundles.
     Never raises.
+
+    `cookie` / `extra_headers` propagate auth (e.g. a session cookie from
+    auth_profiles.yaml) so jsreaper can harvest JS behind authenticated areas
+    of the target — previously these requests were always unauthenticated.
     """
     if not HAS_HTTPX:
         return None, "", {}
     hdrs = {"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}
+    if cookie:
+        hdrs["Cookie"] = cookie
+    if extra_headers:
+        hdrs.update(extra_headers)
     try:
         if client:
             resp = await client.get(url, headers=hdrs)
@@ -426,6 +436,8 @@ async def discover_js_assets(
     client: "httpx.AsyncClient",
     max_size_kb: int,
     deep: bool,
+    cookie: str | None = None,
+    extra_headers: dict | None = None,
 ) -> list[JSAsset]:
     """
     Crawl a host's HTML pages and extract all JS asset URLs.
@@ -456,7 +468,10 @@ async def discover_js_assets(
         if url in crawled_pages:
             return
         crawled_pages.add(url)
-        status, body, hdrs = await fetch(url, client=client, max_size_kb=500)
+        status, body, hdrs = await fetch(
+            url, client=client, max_size_kb=500,
+            cookie=cookie, extra_headers=extra_headers,
+        )
         if not body:
             return
 
@@ -505,7 +520,10 @@ async def discover_js_assets(
         "/js/main.js", "/static/bundle.js",
     ]:
         url = base + common
-        status, body, _ = await fetch(url, client=client, max_size_kb=10)
+        status, body, _ = await fetch(
+            url, client=client, max_size_kb=10,
+            cookie=cookie, extra_headers=extra_headers,
+        )
         if status == 200 and body:
             await add_asset(url)
 
@@ -521,6 +539,8 @@ async def fetch_sourcemap_source(
     js_body: str,
     client: "httpx.AsyncClient",
     max_size_kb: int,
+    cookie: str | None = None,
+    extra_headers: dict | None = None,
 ) -> str:
     """
     If JS has a sourceMappingURL comment, fetch the .map file and
@@ -540,7 +560,10 @@ async def fetch_sourcemap_source(
             return ""
     else:
         map_url = urljoin(js_url, map_ref)
-        status, map_body, _ = await fetch(map_url, client=client, max_size_kb=max_size_kb * 2)
+        status, map_body, _ = await fetch(
+            map_url, client=client, max_size_kb=max_size_kb * 2,
+            cookie=cookie, extra_headers=extra_headers,
+        )
         if not map_body:
             return ""
         try:
@@ -794,6 +817,8 @@ class HostProcessor:
         fetch_sourcemaps: bool   = True,
         deep: bool               = False,
         concurrency: int         = 20,
+        cookie: str | None       = None,
+        extra_headers: dict | None = None,
     ):
         self.domain            = domain
         self.timeout           = timeout
@@ -801,6 +826,8 @@ class HostProcessor:
         self.entropy_threshold = entropy_threshold
         self.fetch_sourcemaps  = fetch_sourcemaps
         self.deep              = deep
+        self.cookie            = cookie
+        self.extra_headers     = extra_headers
         self._sem              = asyncio.Semaphore(concurrency)
         # Global content hash dedup — don't analyse the same JS file twice
         # even if it appears on multiple subdomains (CDN-served bundles)
@@ -826,9 +853,11 @@ class HostProcessor:
             timeout=self.timeout, verify=False,
             follow_redirects=True, headers={"User-Agent": UA},
         ) as client:
-            status, _, _ = await fetch(f"https://{host}/", client=client, max_size_kb=10)
+            status, _, _ = await fetch(f"https://{host}/", client=client, max_size_kb=10,
+                                       cookie=self.cookie, extra_headers=self.extra_headers)
             if status is None:
-                status, _, _ = await fetch(f"http://{host}/", client=client, max_size_kb=10)
+                status, _, _ = await fetch(f"http://{host}/", client=client, max_size_kb=10,
+                                           cookie=self.cookie, extra_headers=self.extra_headers)
                 if status is not None:
                     scheme, port = "http", 80
 
@@ -837,7 +866,10 @@ class HostProcessor:
                 return
 
             # Discover all JS assets
-            assets = await discover_js_assets(host, scheme, port, client, self.max_size_kb, self.deep)
+            assets = await discover_js_assets(
+                host, scheme, port, client, self.max_size_kb, self.deep,
+                cookie=self.cookie, extra_headers=self.extra_headers,
+            )
             log.info(f"[{host}] Found {len(assets)} JS assets")
 
             # Process each asset
@@ -864,7 +896,8 @@ class HostProcessor:
         result: HostResult,
     ) -> None:
         status, body, hdrs = await fetch(
-            asset.url, client=client, max_size_kb=self.max_size_kb
+            asset.url, client=client, max_size_kb=self.max_size_kb,
+            cookie=self.cookie, extra_headers=self.extra_headers,
         )
         if not body or status != 200:
             asset.fetch_error = f"HTTP {status}"
@@ -887,7 +920,10 @@ class HostProcessor:
         if self.fetch_sourcemaps and "sourceMappingURL" in body:
             asset.has_sourcemap = True
             try:
-                source_code = await fetch_sourcemap_source(asset.url, body, client, self.max_size_kb)
+                source_code = await fetch_sourcemap_source(
+                    asset.url, body, client, self.max_size_kb,
+                    cookie=self.cookie, extra_headers=self.extra_headers,
+                )
             except Exception:
                 pass
 
@@ -1410,6 +1446,8 @@ async def main() -> None:
         fetch_sourcemaps=args.sourcemaps,
         deep=args.deep,
         concurrency=args.concurrency,
+        cookie=args.cookie if args.cookie else None,
+        extra_headers=extra_headers,
     )
 
     t0 = time.perf_counter()

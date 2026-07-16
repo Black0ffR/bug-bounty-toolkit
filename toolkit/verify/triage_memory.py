@@ -173,6 +173,30 @@ def build_triage_entries(findings: list[dict[str, Any]], state: PipelineState,
     return entries
 
 
+def apply_filters(entries: list[TriageEntry], *,
+                  severity: str | None = None,
+                  host: str | None = None,
+                  vuln_class_key: str | None = None) -> list[TriageEntry]:
+    """Narrow the active queue by severity / host / vuln class. Case-insensitive
+    substring match on host and class; exact (case-insensitive) match on severity."""
+    if not (severity or host or vuln_class_key):
+        return entries
+    out: list[TriageEntry] = []
+    sev = severity.upper() if severity else None
+    host_l = host.lower() if host else None
+    cls_l = vuln_class_key.lower() if vuln_class_key else None
+    for e in entries:
+        f = e.finding
+        if sev and f.severity.upper() != sev:
+            continue
+        if host_l and host_l not in f.host.lower():
+            continue
+        if cls_l and cls_l not in f.vuln_class_key.lower():
+            continue
+        out.append(e)
+    return out
+
+
 def render_queue_md(entries: list[TriageEntry], *, top: int = 10) -> str:
     """Render the active triage queue as a Markdown checklist."""
     lines: list[str] = []
@@ -426,6 +450,9 @@ def main() -> int:
     ap.add_argument("--batch", action="store_true", help="non-interactive mode — read dispositions from CSV")
     ap.add_argument("--dispositions-csv", help="CSV with finding_id,disposition,note columns (for --batch)")
     ap.add_argument("--decided-by", default=os.environ.get("USER", "interactive"), help="who is deciding (logged in triage_decisions)")
+    ap.add_argument("--filter-severity", help="only show findings of this severity (e.g. CRITICAL)")
+    ap.add_argument("--filter-host", help="only show findings whose host contains this substring")
+    ap.add_argument("--filter-class", help="only show findings whose vuln class contains this substring")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -440,6 +467,8 @@ def main() -> int:
     state = PipelineState(args.db)
     try:
         entries = build_triage_entries(raw_findings, state)
+        entries = apply_filters(entries, severity=args.filter_severity,
+                                host=args.filter_host, vuln_class_key=args.filter_class)
         log.info("active queue: %d findings (after filtering previously submitted/rejected)", len(entries))
 
         md = render_queue_md(entries, top=args.top)

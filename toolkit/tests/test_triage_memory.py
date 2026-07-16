@@ -14,6 +14,8 @@ from toolkit.verify.triage_memory import (
     interactive_triage,
     batch_triage,
     resolve_cvss_vector,
+    apply_filters,
+    TriageEntry,
 )
 from toolkit.infra.pipeline_state import PipelineState
 
@@ -193,3 +195,22 @@ def test_generate_writeup_keeps_explicit_cvss():
                           severity="CRITICAL", title="T", cvss_vector="CVSS:3.1/AV:N/AC:H")
     md = generate_writeup(f, format="h1")
     assert "**CVSS**: CVSS:3.1/AV:N/AC:H" in md
+
+
+def test_apply_filters_by_severity(temp_db):
+    from toolkit.infra.finding import NormalizedFinding
+    entries = [
+        TriageEntry(finding=NormalizedFinding(host="a.com", vuln_class_key="X",
+                     severity="CRITICAL", title="c", source_tool="t"), is_new=True,
+                    previously_submitted=False, previously_rejected=False),
+        TriageEntry(finding=NormalizedFinding(host="b.com", vuln_class_key="Y",
+                     severity="HIGH", title="h", source_tool="t"), is_new=True,
+                    previously_submitted=False, previously_rejected=False),
+        TriageEntry(finding=NormalizedFinding(host="c.com", vuln_class_key="Z",
+                     severity="LOW", title="l", source_tool="t"), is_new=True,
+                    previously_submitted=False, previously_rejected=False),
+    ]
+    assert len(apply_filters(entries, severity="CRITICAL")) == 1
+    assert len(apply_filters(entries, host="b.com")) == 1
+    assert len(apply_filters(entries, vuln_class_key="Y")) == 1
+    assert len(apply_filters(entries)) == 3

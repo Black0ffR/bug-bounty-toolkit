@@ -143,6 +143,7 @@ class Profile:
     user_id: str | int | None = None
     role: str = ""
     email: str = ""
+    auth_header_names: list[str] = field(default_factory=list)
     refresh_callback: Callable[[], str] | None = None
     expires_at: str = ""  # ISO-8601 or epoch-seconds; proactive refresh when near
     _last_refresh: float = field(default=0.0, init=False)
@@ -192,6 +193,7 @@ class AuthProfiles:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path: Path | None = Path(path) if path else None
         self.profiles: dict[str, Profile] = {}
+        self.auth_header_names: list[str] = []
         if self.path:
             self._load()
 
@@ -227,10 +229,18 @@ class AuthProfiles:
                 role=str(raw.get("role", "")),
                 email=str(raw.get("email", "")),
                 expires_at=str(raw.get("expires_at", "")),
+                auth_header_names=[str(x) for x in (raw.get("auth_header_names") or [])],
             )
         # Always have an anonymous profile
         if "anon" not in self.profiles:
             self.profiles["anon"] = Profile(name="anon")
+        # Union of custom auth header names across all profiles, so tools can
+        # strip every auth-carrying header (not just Authorization/Cookie/X-Api-Key)
+        # before replaying a request under a different session.
+        names: set[str] = set()
+        for p in self.profiles.values():
+            names.update(h.lower() for h in p.auth_header_names)
+        self.auth_header_names = sorted(names)
         log.info(
             "auth_profiles loaded: %d profiles (%s)",
             len(self.profiles),

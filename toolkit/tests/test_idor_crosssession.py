@@ -299,3 +299,45 @@ def test_sweep_blast_radius_concurrent(mock_http_server, temp_scope_yaml):
             )
 
     assert asyncio.run(_run()) == 5
+
+
+def test_verify_finding_strips_custom_auth_header(monkeypatch):
+    from toolkit.infra.auth_profiles import Profile
+    import toolkit.verify.idor_crosssession as idor
+
+    profiles = AuthProfiles(None)
+    profiles.profiles = {
+        "user_a": Profile(name="user_a", cookie="a=1",
+                          auth_header_names=["X-Auth-Token"]),
+        "user_b": Profile(name="user_b", cookie="b=2",
+                          auth_header_names=["X-Auth-Token"]),
+    }
+    profiles.auth_header_names = ["X-Auth-Token"]
+
+    class FakeGuard:
+        def check_url(self, *a, **k):
+            return None
+        def acquire_token(self, *a, **k):
+            return True
+        def release_token(self, *a, **k):
+            return None
+
+    seen = []
+    async def fake(client, method, url, headers, body):
+        seen.append({k.lower(): v for k, v in headers.items()})
+        return 200, "same body data", 100
+    monkeypatch.setattr(idor, "_replay_with_client", fake)
+
+    finding = {
+        "id": "f1", "source_tool": "apifuzz.py", "host": "h",
+        "url": "https://h/v1/users/1", "vuln_class_key": "BOLA_POSSIBLE",
+        "severity": "HIGH", "title": "BOLA",
+        "curl_command": "curl -sk -H 'X-Auth-Token: aaaa' https://h/v1/users/1",
+    }
+    res = asyncio.run(idor.verify_finding(finding, profiles, FakeGuard()))
+    assert res is not None
+    # user_b replay is the second captured call
+    user_b_headers = seen[1]
+    assert "x-auth-token" not in user_b_headers
+    # user_a replay (first call) also stripped it (session supplies auth)
+    assert "x-auth-token" not in seen[0]

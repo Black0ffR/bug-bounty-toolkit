@@ -152,3 +152,24 @@ def test_yaml_expires_at_loaded(tmp_path):
     f.write_text(text)
     ap = AuthProfiles(f)
     assert ap.get_profile("user_a").expires_at == "2030-01-01T00:00:00+00:00"
+
+
+def test_auth_header_names_parsed_and_union(tmp_path):
+    if not _HAS_YAML:
+        pytest.skip("PyYAML not installed")
+    text = (
+        "profiles:\n"
+        "  user_a:\n"
+        "    cookie: 'session=abc'\n"
+        "    auth_header_names:\n"
+        "      - X-Auth-Token\n"
+        "  user_b:\n"
+        "    cookie: 'session=def'\n"
+        "    auth_header_names:\n"
+        "      - X-Api-Token\n"
+    )
+    f = tmp_path / "ap.yaml"
+    f.write_text(text)
+    ap = AuthProfiles(f)
+    assert ap.get_profile("user_a").auth_header_names == ["X-Auth-Token"]
+    assert set(ap.auth_header_names) == {"x-auth-token", "x-api-token"}

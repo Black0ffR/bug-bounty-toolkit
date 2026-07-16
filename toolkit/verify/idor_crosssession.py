@@ -304,9 +304,12 @@ async def verify_finding(finding: dict[str, Any], profiles: AuthProfiles,
     except RuntimeError as exc:
         log.error("cannot verify IDOR: %s", exc)
         return None
-    # Strip auth headers from parsed (the session provides them)
-    user_a_headers = {k: v for k, v in parsed["headers"].items()
-                      if k.lower() not in ("authorization", "cookie", "x-api-key")}
+    # Strip auth headers from parsed (the session provides them). Beyond the
+    # standard Authorization/Cookie/X-Api-Key, also strip any custom auth
+    # header names declared in auth_profiles.yaml so user_b never inherits
+    # user_a's custom bearer/token header.
+    _strip = {h.lower() for h in ("authorization", "cookie", "x-api-key", *profiles.auth_header_names)}
+    user_a_headers = {k: v for k, v in parsed["headers"].items() if k.lower() not in _strip}
     user_b_headers = dict(user_a_headers)
     # Acquire rate-limit tokens — one for user_a replay, one for user_b
     if not (guard.acquire_token(timeout=30.0)):

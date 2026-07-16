@@ -1,8 +1,11 @@
 """Unit tests for toolkit.infra.auth_profiles."""
 from __future__ import annotations
 
+import datetime
+
 import pytest
 
+from toolkit.infra import auth_profiles as _ap
 from toolkit.infra.auth_profiles import (
     AuthProfiles,
     Profile,
@@ -10,6 +13,8 @@ from toolkit.infra.auth_profiles import (
     redact_value,
     redact_dict,
 )
+
+_HAS_YAML = _ap._HAS_YAML
 
 
 def test_load_two_users(temp_auth_profiles_yaml):
@@ -107,3 +112,43 @@ def test_maybe_refresh_invokes_callback():
     p.maybe_refresh(max_age=0.001)  # force refresh on first call
     assert state["calls"] == 1
     assert p.bearer == "fresh_token"
+
+
+def test_expires_at_triggers_proactive_refresh():
+    state = {"calls": 0}
+    exp = (datetime.datetime.now(datetime.timezone.utc) +
+           datetime.timedelta(seconds=30)).isoformat()
+    p = Profile(name="x", bearer="original", expires_at=exp,
+                refresh_callback=lambda: state.__setitem__("calls", state["calls"] + 1) or "fresh")
+    p.maybe_refresh()  # within 60s of expiry → refresh
+    assert state["calls"] == 1
+    assert p.bearer == "fresh"
+
+
+def test_expires_at_far_future_skips_refresh():
+    state = {"calls": 0}
+    exp = (datetime.datetime.now(datetime.timezone.utc) +
+           datetime.timedelta(seconds=3600)).isoformat()
+    p = Profile(name="x", bearer="original", expires_at=exp,
+                refresh_callback=lambda: state.__setitem__("calls", state["calls"] + 1) or "fresh")
+    p.maybe_refresh()  # first call always refreshes (last_refresh unset)
+    assert state["calls"] == 1
+    # second call soon after: far from expiry AND within max_age → no refresh
+    p.maybe_refresh()
+    assert state["calls"] == 1
+    assert p.bearer == "fresh"
+
+
+def test_yaml_expires_at_loaded(tmp_path):
+    if not _HAS_YAML:
+        pytest.skip("PyYAML not installed")
+    text = (
+        "profiles:\n"
+        "  user_a:\n"
+        "    cookie: 'session=abc'\n"
+        "    expires_at: '2030-01-01T00:00:00+00:00'\n"
+    )
+    f = tmp_path / "ap.yaml"
+    f.write_text(text)
+    ap = AuthProfiles(f)
+    assert ap.get_profile("user_a").expires_at == "2030-01-01T00:00:00+00:00"

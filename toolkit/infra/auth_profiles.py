@@ -81,6 +81,31 @@ from toolkit.infra.scope_guard import _fallback_yaml_parse
 log = logging.getLogger("auth_profiles")
 
 
+def _parse_expiry(value: Any) -> float | None:
+    """Parse an expiry given as epoch-seconds (int/float/str) or an ISO-8601
+    string into an epoch float. Returns None if it can't be parsed."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 # Field names whose values get redacted in any log output.
 _SENSITIVE_FIELDS = {"cookie", "bearer", "api_key", "apikey", "password", "token", "secret"}
 _REDACT_REPLACEMENT = "<redacted>"
@@ -119,6 +144,7 @@ class Profile:
     role: str = ""
     email: str = ""
     refresh_callback: Callable[[], str] | None = None
+    expires_at: str = ""  # ISO-8601 or epoch-seconds; proactive refresh when near
     _last_refresh: float = field(default=0.0, init=False)
 
     def auth_headers(self) -> dict[str, str]:
@@ -134,21 +160,30 @@ class Profile:
         h.update(self.headers)
         return h
 
-    def maybe_refresh(self, max_age: float = 1800.0) -> None:
-        """If a refresh_callback is registered and the cached bearer is older
-        than max_age seconds, invoke the callback and replace self.bearer."""
+    def maybe_refresh(self, max_age: float = 1800.0, early: float = 60.0) -> None:
+        """If a refresh_callback is registered, refresh the bearer when either
+        the cached token is older than ``max_age`` seconds, OR a configured
+        ``expires_at`` is within ``early`` seconds (proactive refresh so a tool
+        never sends an expired token)."""
         if self.refresh_callback is None:
             return
         now = time.time()
+        exp = _parse_expiry(self.expires_at) if self.expires_at else None
+        if exp is not None and (exp - now) <= early:
+            self._do_refresh(now)
+            return
         if self._last_refresh == 0.0 or (now - self._last_refresh) > max_age:
-            try:
-                new_token = self.refresh_callback()
-                if new_token:
-                    self.bearer = new_token
-                    self._last_refresh = now
-                    log.info("profile %s: bearer refreshed", self.name)
-            except Exception as exc:
-                log.warning("profile %s: refresh callback failed: %s", self.name, exc)
+            self._do_refresh(now)
+
+    def _do_refresh(self, now: float) -> None:
+        try:
+            new_token = self.refresh_callback()
+            if new_token:
+                self.bearer = new_token
+                self._last_refresh = now
+                log.info("profile %s: bearer refreshed", self.name)
+        except Exception as exc:
+            log.warning("profile %s: refresh callback failed: %s", self.name, exc)
 
 
 class AuthProfiles:
@@ -191,6 +226,7 @@ class AuthProfiles:
                 user_id=raw.get("user_id"),
                 role=str(raw.get("role", "")),
                 email=str(raw.get("email", "")),
+                expires_at=str(raw.get("expires_at", "")),
             )
         # Always have an anonymous profile
         if "anon" not in self.profiles:

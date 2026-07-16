@@ -74,6 +74,37 @@ log = logging.getLogger("triage_memory")
 _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
+# Default CVSS 3.1 vector per vulnerability class, used when a finding arrives
+# without an explicit cvss_vector (previously the writeup rendered 'n/a' and
+# triage lost the severity signal). Conservative, defensible baselines.
+_DEFAULT_CVSS_BY_CLASS: dict[str, str] = {
+    "BOLA_CONFIRMED": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+    "BOLA_POSSIBLE": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
+    "IDOR_PARAM": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
+    "JWT_NONE": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+    "PRIV_ESCALATION": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    "MASS_ASSIGN": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+    "SSRF_CLOUD_METADATA": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+    "SSRF_INTERNAL": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
+    "SECRET_IN_GIT": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "SUBDOMAIN_TAKEOVER": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "GQL_INTROSPECTION": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "RATE_LIMIT_API": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "HIDDEN_PARAM": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "DEBUG_BYPASS": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "PARAM_POLLUTION": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+    "ARRAY_INJECTION": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+}
+
+
+def resolve_cvss_vector(finding: NormalizedFinding) -> str:
+    """Return the finding's explicit CVSS vector, falling back to a class-based
+    default so writeups never silently lose the severity signal."""
+    if finding.cvss_vector and finding.cvss_vector.strip():
+        return finding.cvss_vector
+    return _DEFAULT_CVSS_BY_CLASS.get(finding.vuln_class_key, "n/a")
+
+
 @dataclass
 class TriageEntry:
     finding: NormalizedFinding
@@ -204,7 +235,7 @@ def generate_writeup(finding: NormalizedFinding, *, format: str = "h1") -> str:
             f"**Affected URL**: `{finding.url}`",
             f"**Vulnerability class**: `{finding.vuln_class_key}`",
             f"**Source tool**: `{finding.source_tool}`" + (f" (verified by `{finding.verified_by}`)" if finding.verified_by else ""),
-            f"**CVSS**: {finding.cvss_vector or 'n/a'}",
+            f"**CVSS**: {resolve_cvss_vector(finding)}",
             f"**CWE**: {finding.cwe or 'n/a'}",
             f"**OWASP**: {finding.owasp or 'n/a'}",
             "",

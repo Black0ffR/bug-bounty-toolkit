@@ -13,6 +13,7 @@ from toolkit.verify.triage_memory import (
     generate_writeup,
     interactive_triage,
     batch_triage,
+    resolve_cvss_vector,
 )
 from toolkit.infra.pipeline_state import PipelineState
 
@@ -164,3 +165,31 @@ def test_interactive_triage_eof_exits_cleanly(temp_db, sample_nuclei_harvest_jso
         sys.stdin = old_stdin
     # Should not raise; count is whatever was recorded before EOF (0 in this case)
     assert count == 0
+
+
+def test_resolve_cvss_vector_defaults_by_class():
+    from toolkit.infra.finding import NormalizedFinding
+    f = NormalizedFinding(source_tool="t", host="h", vuln_class_key="BOLA_CONFIRMED",
+                          severity="CRITICAL", title="T")
+    assert f.cvss_vector == ""
+    vec = resolve_cvss_vector(f)
+    assert vec.startswith("CVSS:3.1")
+    assert vec == "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"
+
+
+def test_generate_writeup_uses_default_cvss_when_empty():
+    from toolkit.infra.finding import NormalizedFinding
+    f = NormalizedFinding(source_tool="apifuzz.py", host="api.example.com",
+                          url="https://api.example.com/v1/users/1",
+                          vuln_class_key="BOLA_CONFIRMED", severity="CRITICAL",
+                          title="Test IDOR", detail="x", evidence="ev1")
+    md = generate_writeup(f, format="h1")
+    assert "**CVSS**: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N" in md
+
+
+def test_generate_writeup_keeps_explicit_cvss():
+    from toolkit.infra.finding import NormalizedFinding
+    f = NormalizedFinding(source_tool="t", host="h", vuln_class_key="BOLA_CONFIRMED",
+                          severity="CRITICAL", title="T", cvss_vector="CVSS:3.1/AV:N/AC:H")
+    md = generate_writeup(f, format="h1")
+    assert "**CVSS**: CVSS:3.1/AV:N/AC:H" in md

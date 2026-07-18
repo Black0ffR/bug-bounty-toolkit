@@ -21,6 +21,10 @@ Steps:
         - IDOR        (toolkit/testers/idor.py, heuristic)
         - XXE         (toolkit/testers/xxe.py)
         - AccessCtrl  (toolkit/testers/access_control.py, heuristic)
+        - SSRF        (toolkit/testers/ssrf.py)
+        - NoSQLi      (toolkit/testers/nosqli.py)
+        - GraphQL     (toolkit/testers/graphql.py)
+        - Deserialization (toolkit/testers/deserialization.py, heuristic)
    3. Run context-aware XSS verification (toolkit/verify/xss_context.py) on
       query-injected params.
    4. Aggregate normalized findings and emit JSON + (optional) reports.
@@ -47,7 +51,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from toolkit.infra import spider, scope_guard, logfmt
     from toolkit.testers import (sqli, cmdi, lfi, ssti, openredirect, cors, csrf,
-                                idor, xxe, access_control)
+                                idor, xxe, access_control, ssrf, nosqli,
+                                graphql, deserialization)
     from toolkit.verify import xss_context
     _HAVE_TOOLKIT = True
 except Exception as exc:  # pragma: no cover
@@ -107,6 +112,10 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
             (idor, idor.run_idor),
             (xxe, xxe.run_xxe),
             (access_control, access_control.run_access_control),
+            (ssrf, ssrf.run_ssrf),
+            (nosqli, nosqli.run_nosqli),
+            (graphql, graphql.run_graphql),
+            (deserialization, deserialization.run_deserialization),
         ):
             try:
                 res = await runner(endpoints, client, timeout=args.timeout,

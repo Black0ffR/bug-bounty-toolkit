@@ -78,8 +78,14 @@ except ImportError:
     console = None
 
 import logging
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("apifuzz")
+
+# C20: optional JSON log format; falls back to basicConfig when toolkit absent.
+try:
+    from toolkit.infra import logfmt as _logfmt
+    _HAVE_LOGFMT = True
+except Exception:  # pragma: no cover - only when run without toolkit package
+    _HAVE_LOGFMT = False
 for _n in ("httpx", "httpcore"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 
@@ -1811,12 +1817,19 @@ Output      : JSON + HTML report with curl PoC per finding
     p.add_argument("--user-agent",  metavar="UA",
                    help="Override the User-Agent header sent on every request (C18)")
     p.add_argument("-v","--verbose",action="store_true", help="Verbose logging")
+    p.add_argument("--log-format", choices=("text", "json"), default="text",
+                   help="Log output format (C20)")
     return p.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
-    if args.verbose:
+    if _HAVE_LOGFMT:
+        _logfmt.configure_logging(
+            format=args.log_format,
+            level=logging.DEBUG if args.verbose else logging.INFO,
+        )
+    elif args.verbose:
         log.setLevel(logging.DEBUG)
     if args.user_agent:
         set_user_agent(args.user_agent)

@@ -318,15 +318,64 @@ async def api_request(
         return None, {}, "", 0
 
 
-def _auth_headers(token: str | None) -> dict:
+def _looks_like_jwt(token: str) -> bool:
+    parts = token.split(".")
+    return len(parts) == 3 and all(parts)
+
+
+def detect_session_shape(token: str) -> str:
+    """Classify a --session-a/--session-b value so it is sent with the right
+    header. Previously any raw value was wrapped as `Bearer <value>`, which
+    silently broke cookie-shaped sessions. Shapes:
+      jwt    — `Bearer <JWT>` or a bare 3-part JWT
+      bearer — `Bearer <opaque>`
+      basic  — `Basic <...>`
+      cookie — `Cookie: a=b` or bare `name=value`
+      raw    — opaque token (default → Bearer)
+      none   — empty
+    """
+    t = (token or "").strip()
+    if not t:
+        return "none"
+    low = t.lower()
+    if low.startswith("bearer "):
+        return "jwt" if _looks_like_jwt(t[len("bearer "):].strip()) else "bearer"
+    if low.startswith("basic "):
+        return "basic"
+    if low.startswith("cookie:"):
+        return "cookie"
+    # bare cookie: single `name=value` (not a JWT, not JSON)
+    if re.match(r"^[A-Za-z0-9_\-]+=[^=]+$", t) and not _looks_like_jwt(t):
+        return "cookie"
+    if _looks_like_jwt(t):
+        return "jwt"
+    return "raw"
+
+
+def build_auth_headers(token: str | None) -> dict:
+    """Build the auth headers for a session token, honouring its detected
+    shape. Cookie-shaped tokens go in a `Cookie:` header instead of being
+    wrongly wrapped as `Bearer <name=value>`."""
     if not token:
         return {}
-    if token.startswith("Bearer ") or token.startswith("bearer "):
-        return {"Authorization": token}
-    if token.startswith("Basic "):
-        return {"Authorization": token}
-    # Raw token — assume Bearer
-    return {"Authorization": f"Bearer {token}"}
+    t = token.strip()
+    shape = detect_session_shape(t)
+    if shape == "cookie":
+        cookie_val = t
+        if t.lower().startswith("cookie:"):
+            cookie_val = t[len("cookie:"):].strip()
+        return {"Cookie": cookie_val}
+    if shape in ("jwt", "bearer"):
+        return {"Authorization": t if t.lower().startswith("bearer ") else f"Bearer {t}"}
+    if shape == "basic":
+        return {"Authorization": t}
+    # raw → Bearer by default
+    return {"Authorization": f"Bearer {t}"}
+
+
+def _auth_headers(token: str | None) -> dict:
+    """Backwards-compatible wrapper — now shape-aware (C16)."""
+    return build_auth_headers(token)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1771,9 +1820,13 @@ async def main() -> None:
         sys.exit(1)
 
     if args.session_a:
-        log.info(f"[Config] Session A: {args.session_a[:30]}...")
+        shape_a = detect_session_shape(args.session_a)
+        log.info(f"[Config] Session A: {args.session_a[:30]}... (shape={shape_a})")
+        if shape_a == "cookie":
+            log.info("[Config] Cookie-shaped session detected — using Cookie: header")
     if args.session_b:
-        log.info(f"[Config] Session B: {args.session_b[:30]}...")
+        shape_b = detect_session_shape(args.session_b)
+        log.info(f"[Config] Session B: {args.session_b[:30]}... (shape={shape_b})")
         log.info("[Config] BOLA/IDOR cross-user verification enabled")
     else:
         log.info("[Config] No session tokens — auth tests will use heuristics only")

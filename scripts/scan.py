@@ -18,6 +18,9 @@ Steps:
         - OpenRedirect (toolkit/testers/openredirect.py)
         - CORS        (toolkit/testers/cors.py)
         - CSRF        (toolkit/testers/csrf.py, heuristic)
+        - IDOR        (toolkit/testers/idor.py, heuristic)
+        - XXE         (toolkit/testers/xxe.py)
+        - AccessCtrl  (toolkit/testers/access_control.py, heuristic)
    3. Run context-aware XSS verification (toolkit/verify/xss_context.py) on
       query-injected params.
    4. Aggregate normalized findings and emit JSON + (optional) reports.
@@ -43,7 +46,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from toolkit.infra import spider, scope_guard, logfmt
-    from toolkit.testers import (sqli, cmdi, lfi, ssti, openredirect, cors, csrf)
+    from toolkit.testers import (sqli, cmdi, lfi, ssti, openredirect, cors, csrf,
+                                idor, xxe, access_control)
     from toolkit.verify import xss_context
     _HAVE_TOOLKIT = True
 except Exception as exc:  # pragma: no cover
@@ -100,6 +104,9 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
             (ssti, ssti.run_ssti),
             (openredirect, openredirect.run_openredirect),
             (cors, cors.run_cors),
+            (idor, idor.run_idor),
+            (xxe, xxe.run_xxe),
+            (access_control, access_control.run_access_control),
         ):
             try:
                 res = await runner(endpoints, client, timeout=args.timeout,

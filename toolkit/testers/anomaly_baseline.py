@@ -61,9 +61,11 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import logging
 import math
+import re
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -86,6 +88,7 @@ class ResponseSpec:
     size_bytes: int = 0
     elapsed_ms: float = 0.0
     headers: dict[str, str] = field(default_factory=dict)
+    body: str = ""              # full (or representative) response body
     body_snippet: str = ""
     label: str = ""    # human-readable tag for the observation
 
@@ -99,6 +102,7 @@ class Anomaly:
     timing_z: float
     size_z: float
     status_changed: bool
+    body_changed: bool
     headers_diff: dict[str, list[str]]   # {"added": [...], "removed": [...]}
     severity: str
     detail: str
@@ -123,6 +127,9 @@ class AnomalyDetector:
         self._baseline_sizes: list[int] = []
         self._baseline_statuses: set[int] = set()
         self._baseline_header_keys: set[str] = set()
+        # Body / structural-change baseline
+        self._baseline_body_sigs: set[str] = set()
+        self._baseline_body_present: bool = False
         # Calibrated parameters
         self._timing_mean: float = 0.0
         self._timing_stdev: float = 0.0
@@ -136,6 +143,9 @@ class AnomalyDetector:
         self._baseline_sizes.append(int(spec.size_bytes))
         self._baseline_statuses.add(int(spec.status))
         self._baseline_header_keys.update(k.lower() for k in spec.headers.keys())
+        if spec.body:
+            self._baseline_body_present = True
+            self._baseline_body_sigs.add(self._body_sig(spec.body))
 
     def calibrate(self) -> None:
         """Compute mean/stdev from observed baseline. After this, observe() must
@@ -164,6 +174,22 @@ class AnomalyDetector:
 
     def _status_class(self, status: int) -> int:
         return status // 100
+
+    def _canonical_body(self, body: str) -> str:
+        """Normalize a response body to a structure-only signature: replace
+        dynamic value tokens (uuids, long hex, numbers) and collapse whitespace
+        so that two responses that differ ONLY in dynamic values are treated as
+        structurally identical. """
+        s = re.sub(
+            r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+            r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', '{uuid}', body)
+        s = re.sub(r'\b[0-9a-fA-F]{32,}\b', '{hex}', s)
+        s = re.sub(r'\d+', '{n}', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+
+    def _body_sig(self, body: str) -> str:
+        return hashlib.sha256(self._canonical_body(body).encode("utf-8")).hexdigest()
 
     def check(self, spec: ResponseSpec) -> Anomaly | None:
         """Check a single response against the calibrated baseline. Returns an
@@ -198,11 +224,23 @@ class AnomalyDetector:
             reasons.append(f"new headers: {added}")
         if removed:
             reasons.append(f"missing headers: {removed}")
-        # Verdict: anomalous if at least 2 signals triggered
-        is_anom = len(reasons) >= 2
+        # Body / structural change — flags content changes that leave the byte
+        # length (and therefore the size z-score) completely unchanged.
+        body_changed = False
+        if self._baseline_body_present and spec.body:
+            if self._body_sig(spec.body) not in self._baseline_body_sigs:
+                body_changed = True
+                reasons.append(
+                    "response body content changed (structural diff) — same-length "
+                    "content swap not caught by size signal")
+        # Verdict: anomalous if at least 2 signals trigger, OR a body content
+        # change is observed (a content swap is itself a meaningful deviation).
+        is_anom = len(reasons) >= 2 or body_changed
         severity = "INFO"
         if is_anom:
             if status_changed and abs(timing_z) >= self.threshold_stdev:
+                severity = "HIGH"
+            elif body_changed and status_changed:
                 severity = "HIGH"
             elif len(reasons) >= 3:
                 severity = "HIGH"
@@ -215,6 +253,7 @@ class AnomalyDetector:
             timing_z=timing_z if math.isfinite(timing_z) else 999.0,
             size_z=size_z if math.isfinite(size_z) else 999.0,
             status_changed=status_changed,
+            body_changed=body_changed,
             headers_diff=headers_diff,
             severity=severity,
             detail="; ".join(reasons) if reasons else "no anomaly signals triggered",
@@ -244,6 +283,7 @@ def to_finding(anom: Anomaly, source_tool: str = "anomaly_baseline.py") -> dict[
             "timing_z": anom.timing_z,
             "size_z": anom.size_z,
             "status_changed": anom.status_changed,
+            "body_changed": anom.body_changed,
             "headers_diff": anom.headers_diff,
             "reasons": anom.reasons,
         },
@@ -287,7 +327,9 @@ def main() -> int:
             url=r.get("url", ""), method=r.get("method", "GET"),
             status=int(r.get("status", 0)), size_bytes=int(r.get("size_bytes", 0)),
             elapsed_ms=float(r.get("elapsed_ms", 0.0)),
-            headers=r.get("headers", {}), body_snippet=r.get("body_snippet", ""),
+            headers=r.get("headers", {}),
+            body=r.get("body", r.get("body_snippet", "")),
+            body_snippet=r.get("body_snippet", ""),
             label=r.get("label", ""),
         ))
     det.calibrate()
@@ -299,7 +341,9 @@ def main() -> int:
             url=r.get("url", ""), method=r.get("method", "GET"),
             status=int(r.get("status", 0)), size_bytes=int(r.get("size_bytes", 0)),
             elapsed_ms=float(r.get("elapsed_ms", 0.0)),
-            headers=r.get("headers", {}), body_snippet=r.get("body_snippet", ""),
+            headers=r.get("headers", {}),
+            body=r.get("body", r.get("body_snippet", "")),
+            body_snippet=r.get("body_snippet", ""),
             label=r.get("label", ""),
         )
         a = det.check(spec)
@@ -308,7 +352,8 @@ def main() -> int:
         anomalies.append({
             "url": a.url, "label": a.label, "is_anomalous": a.is_anomalous,
             "reasons": a.reasons, "timing_z": a.timing_z, "size_z": a.size_z,
-            "status_changed": a.status_changed, "headers_diff": a.headers_diff,
+            "status_changed": a.status_changed, "body_changed": a.body_changed,
+            "headers_diff": a.headers_diff,
             "severity": a.severity, "detail": a.detail,
         })
         if a.is_anomalous:

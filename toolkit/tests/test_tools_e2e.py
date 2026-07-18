@@ -231,8 +231,8 @@ def test_anomaly_to_finding():
     a = Anomaly(
         url="https://example.com/x", label="probe",
         is_anomalous=True, reasons=["timing", "status"],
-        timing_z=4.5, size_z=0.5, status_changed=True,
-        headers_diff={"added": ["X-New"], "removed": []},
+            timing_z=4.5, size_z=0.5, status_changed=True, body_changed=False,
+            headers_diff={"added": ["X-New"], "removed": []},
         severity="HIGH", detail="multi-signal anomaly",
     )
     f = anomaly_to_finding(a)

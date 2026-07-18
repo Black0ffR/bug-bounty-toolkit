@@ -55,3 +55,47 @@ def test_to_finding_shape():
     assert f["source_tool"] == "anomaly_baseline.py"
     assert f["vuln_class_key"] == "RESPONSE_ANOMALY"
     assert f["severity"] == "HIGH"
+
+
+def test_body_change_flagged_even_when_length_unchanged():
+    """B11: a same-length content swap must be flagged as an anomaly even
+    though the size z-score stays at zero."""
+    det = AnomalyDetector(min_samples=2)
+    for t in [100.0, 102.0, 98.0, 101.0, 99.0]:
+        det.observe(_spec(elapsed=t, size=100, status=200))
+    det.observe(ResponseSpec(status=200, size_bytes=100, elapsed_ms=100.0,
+                             headers={}, body="token=aaaaaaaa"))
+    det.calibrate()
+    # Same 100 bytes, same status, near-baseline timing — but content differs.
+    anom = det.check(ResponseSpec(status=200, size_bytes=100, elapsed_ms=100.0,
+                                  headers={}, body="token=bbbbbbbb"))
+    assert anom is not None
+    assert anom.body_changed is True
+    assert anom.is_anomalous is True
+    assert anom.severity == "MEDIUM"
+
+
+def test_body_unchanged_not_flagged():
+    det = AnomalyDetector(min_samples=2)
+    for t in [100.0, 102.0, 98.0, 101.0, 99.0]:
+        det.observe(_spec(elapsed=t, size=100, status=200))
+    det.observe(ResponseSpec(status=200, size_bytes=100, elapsed_ms=100.0,
+                             headers={}, body="value=42"))
+    det.calibrate()
+    anom = det.check(ResponseSpec(status=200, size_bytes=100, elapsed_ms=100.0,
+                                  headers={}, body="value=42"))
+    assert anom.body_changed is False
+    assert anom.is_anomalous is False
+
+
+def test_body_structural_normalization_ignores_numbers():
+    """'user 1' and 'user 999' are structurally identical → not flagged."""
+    det = AnomalyDetector(min_samples=2)
+    for t in [100.0, 102.0, 98.0, 101.0, 99.0]:
+        det.observe(_spec(elapsed=t, size=100, status=200))
+    det.observe(ResponseSpec(status=200, size_bytes=100, elapsed_ms=100.0,
+                             headers={}, body="user 1"))
+    det.calibrate()
+    anom = det.check(ResponseSpec(status=200, size_bytes=100, elapsed_ms=100.0,
+                                  headers={}, body="user 999"))
+    assert anom.body_changed is False

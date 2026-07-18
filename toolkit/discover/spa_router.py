@@ -80,6 +80,86 @@ class Route:
     pattern: str                  # which regex/pattern matched
     line: int = 0                 # line number in source, if known
     extra: dict[str, Any] = field(default_factory=dict)
+    params: list[str] = field(default_factory=list)  # C7: named params derived from path
+
+    def __post_init__(self) -> None:
+        # Always (re)derive params from the path pattern so downstream
+        # testers can fuzz each dynamic segment regardless of how the
+        # Route was constructed.
+        self.params = extract_params(self.path)
+
+
+# ── C7: named-parameter extraction + param parsers ─────────────────────────────
+# Parse dynamic segments out of framework route patterns:
+#   :id        (react-router, vue-router, remix)
+#   {id} {id?} (remix, some vue configs)
+#   [id] [...slug]  (Next.js / Nuxt dynamic + catch-all)
+#   <id> <$id> (SvelteKit)
+
+_COLON_PARAM = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+_BRACE_PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\??\}")
+_BRACKET_PARAM = re.compile(r"\[(\.\.\.)?([A-Za-z_][A-Za-z0-9_]*)\]")
+_ANGLE_PARAM = re.compile(r"<(\$?[A-Za-z_][A-Za-z0-9_]*)>")
+
+
+def extract_params(path: str) -> list[str]:
+    """Return the ordered, de-duplicated list of named params in a route path."""
+    raw: list[str] = []
+    raw += [m.group(1) for m in _COLON_PARAM.finditer(path)]
+    raw += [m.group(1) for m in _BRACE_PARAM.finditer(path)]
+    raw += [m.group(2) for m in _BRACKET_PARAM.finditer(path)]
+    raw += [m.group(1).lstrip("$") for m in _ANGLE_PARAM.finditer(path)]
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in raw:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+# Param-type parsers: a registry mapping a guessed/declared type to a sample
+# generator. Extend via register_param_parser().
+PARAM_PARSERS: dict[str, Any] = {}
+
+
+def register_param_parser(param_type: str, fn) -> None:
+    PARAM_PARSERS[param_type] = fn
+
+
+def infer_param_type(name: str) -> str:
+    """Heuristically guess a param's type from its name."""
+    n = name.lower()
+    if "email" in n:
+        return "email"
+    if "uuid" in n:
+        return "uuid"
+    if n == "id" or n.endswith("id"):
+        return "id"
+    if any(k in n for k in ("page", "offset", "limit", "count", "index", "size")):
+        return "int"
+    return "string"
+
+
+register_param_parser("int", lambda name: ["0", "1", "-1", "999999999"])
+register_param_parser("uuid", lambda name: [
+    "00000000-0000-0000-0000-000000000000",
+    "ffffffff-ffff-ffff-ffff-ffffffffffff",
+])
+register_param_parser("email", lambda name: ["admin@example.com", "test@example.com"])
+register_param_parser("id", lambda name: ["1", "2", "000000", "admin", "-1"])
+register_param_parser("string", lambda name: ["test", "a", "1", "aaaa"])
+
+
+def param_samples(name: str, param_type: str | None = None, count: int | None = None) -> list[str]:
+    """Return fuzz-friendly sample values for a param. Type is `param_type`
+    if given, else inferred from `name`."""
+    ptype = param_type or infer_param_type(name)
+    fn = PARAM_PARSERS.get(ptype, PARAM_PARSERS["string"])
+    samples = list(fn(name))
+    if count is not None:
+        return samples[:count]
+    return samples
 
 
 # ── Next.js route extraction ─────────────────────────────────────────────────

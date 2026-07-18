@@ -1,0 +1,32 @@
+# Integration test environment for Bug Bounty Toolkit (C23)
+#
+# Runs the full pytest suite inside a clean container so the test environment
+# is reproducible and independent of the local machine. The toolkit mounts as
+# a volume so a single `docker compose up` exercises the current checkout.
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm test
+#
+# The optional `target` service is a mock HTTP endpoint (httpbin) useful for
+# live integration checks that need a real server; it is not required for the
+# unit/integration suite, which mocks HTTP.
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python -m pytest toolkit/tests/ -q --cov=toolkit --cov-report=term-missing
+    # Uncomment to point live integration tests at the mock target:
+    # environment:
+    #   TARGET_BASE_URL: http://target:8080
+
+  target:
+    image: mccutchen/go-httpbin:v2.14.0
+    ports:
+      - "8080:8080"
+    profiles: ["integration"]

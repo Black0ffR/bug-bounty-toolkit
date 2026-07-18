@@ -60,6 +60,8 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field, asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -80,9 +82,12 @@ class Callback:
 
 class CallbackStore:
     """Thread-safe in-memory store with periodic flush to JSON state file."""
-    def __init__(self, state_file: Path, retention_hours: int = 24) -> None:
+    def __init__(self, state_file: Path, retention_hours: int = 24,
+                 webhook_url: str | None = None, _sender=None) -> None:
         self.state_file = state_file
         self.retention_seconds = retention_hours * 3600
+        self.webhook_url = webhook_url
+        self._sender = _sender  # injectable for tests (callable taking a dict)
         self._lock = threading.Lock()
         self._callbacks: list[Callback] = []
         self._load()
@@ -108,6 +113,22 @@ class CallbackStore:
                 if self._parse_iso(c.timestamp) > (now - self.retention_seconds)
             ]
             self._flush_locked()
+        # Webhook forward happens outside the lock (network I/O)
+        if self.webhook_url:
+            sender = self._sender or self._default_sender
+            threading.Thread(target=sender, args=(asdict(cb),), daemon=True).start()
+
+    def _default_sender(self, payload: dict) -> None:
+        if not self.webhook_url:
+            return
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.webhook_url, data=body, headers={"Content-Type": "application/json"}
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("webhook forward failed: %s", exc)
 
     def get(self, callback_id: str) -> list[Callback]:
         with self._lock:
@@ -116,6 +137,23 @@ class CallbackStore:
     def all_(self) -> list[Callback]:
         with self._lock:
             return list(self._callbacks)
+
+    def query(self, callback_id: str | None = None, since: str | None = None,
+              until: str | None = None, limit: int | None = None) -> list[Callback]:
+        """C11: filter callbacks by id/time-range, optionally capped at `limit`."""
+        with self._lock:
+            results = list(self._callbacks)
+        if callback_id is not None:
+            results = [c for c in results if c.callback_id == callback_id]
+        if since is not None:
+            t = self._parse_iso(since)
+            results = [c for c in results if self._parse_iso(c.timestamp) >= t]
+        if until is not None:
+            t = self._parse_iso(until)
+            results = [c for c in results if self._parse_iso(c.timestamp) <= t]
+        if limit is not None and limit > 0:
+            results = results[-limit:]
+        return results
 
     def _flush_locked(self) -> None:
         if not self.state_file:
@@ -156,30 +194,14 @@ class DNSHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         data, sock = self.request
-        if len(data) < 12:
-            return
-        try:
-            # Parse the DNS query name from the question section
-            qname, qtype = self._parse_query(data)
-            if not qname:
-                return
-            # Extract callback_id (first label before the base domain)
-            callback_id = self._extract_callback_id(qname)
-            cb = Callback(
-                callback_id=callback_id,
-                timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-                protocol="dns",
-                source_ip=self.client_address[0],
-                details={"query_name": qname, "query_type": qtype},
-            )
-            self.store.add(cb)
-            log.info("DNS query from %s: %s (%s) — callback_id=%s",
-                     self.client_address[0], qname, qtype, callback_id)
-            # Build the response
-            response = self._build_response(data, qname, qtype)
-            sock.sendto(response, self.client_address)
-        except Exception as exc:
-            log.debug("DNS handler error: %s", exc)
+        resp = process_dns_packet(
+            self.store, self.base_domain, self.reply_ip, data, self.client_address[0]
+        )
+        if resp is not None:
+            try:
+                sock.sendto(resp, self.client_address)
+            except OSError:
+                pass
 
     @staticmethod
     def _parse_query(data: bytes) -> tuple[str, str]:
@@ -210,47 +232,74 @@ class DNSHandler(socketserver.BaseRequestHandler):
         return (qname, qtype_map.get(qtype, str(qtype)))
 
     def _extract_callback_id(self, qname: str) -> str:
-        """Extract the first label (callback_id) from the query name.
-        If the query doesn't end with the base domain, return the whole qname."""
-        qname = qname.lower().rstrip(".")
-        base = self.base_domain.lower().rstrip(".")
-        if qname.endswith("." + base) or qname == base:
-            prefix = qname[:-len("." + base)] if qname != base else ""
-            return prefix.split(".")[0] if prefix else "_root"
-        return qname.split(".")[0]
+        return extract_callback_id(qname, self.base_domain)
 
-    def _build_response(self, query: bytes, qname: str, qtype: str) -> bytes:
-        """Build a minimal DNS response: copy the query, set QR=1, append a single
-        A record answer pointing to reply_ip. For non-A queries, return NXDOMAIN-ish
-        (just QR=1 with no answers) so the caller knows we received it."""
-        # Copy header, set QR=1 (response), RA=1 (recursion available)
-        header = bytearray(query[:12])
-        header[2] |= 0x80  # QR=1
-        header[3] |= 0x80  # RA=1
-        # ANCOUNT=0 unless we're answering A
-        ancount = 0
-        answer_section = b""
-        if qtype == "A":
-            ancount = 1
-            # Answer: pointer to qname (0xc00c), type A, class IN, TTL 60, RDLENGTH 4, RDATA 127.0.0.1
-            answer_section = (
-                b"\xc0\x0c"  # pointer to qname at offset 12
-                b"\x00\x01"  # type A
-                b"\x00\x01"  # class IN
-                b"\x00\x00\x00\x3c"  # TTL 60
-                b"\x00\x04"  # RDLENGTH 4
-                + bytes(int(p) for p in self.reply_ip.split("."))
-            )
-        elif qtype == "AAAA":
-            ancount = 1
-            answer_section = (
-                b"\xc0\x0c\x00\x1c\x00\x01\x00\x00\x00\x3c\x00\x10"
-                + b"\x00" * 16  # ::1
-            )
-        header[6:8] = ancount.to_bytes(2, "big")
-        header[8:10] = (0).to_bytes(2, "big")  # NSCOUNT
-        header[10:12] = (0).to_bytes(2, "big")  # ARCOUNT
-        return bytes(header) + query[12:] + answer_section
+
+def extract_callback_id(qname: str, base_domain: str) -> str:
+    """Extract the first label (callback_id) from a query/host name.
+    If the name doesn't end with the base domain, return the first label."""
+    qname = qname.lower().rstrip(".")
+    base = base_domain.lower().rstrip(".")
+    if qname.endswith("." + base) or qname == base:
+        prefix = qname[:-len("." + base)] if qname != base else ""
+        return prefix.split(".")[0] if prefix else "_root"
+    return qname.split(".")[0]
+
+
+def process_dns_packet(store: CallbackStore, base_domain: str, reply_ip: str,
+                       data: bytes, source_ip: str) -> bytes | None:
+    """Parse a single DNS query, log it as a callback, and return the response
+    bytes. Shared by the UDP and TCP DNS servers. Returns None on malformed input."""
+    if len(data) < 12:
+        return None
+    try:
+        qname, qtype = DNSHandler._parse_query(data)
+        if not qname:
+            return None
+        callback_id = extract_callback_id(qname, base_domain)
+        store.add(Callback(
+            callback_id=callback_id,
+            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            protocol="dns",
+            source_ip=source_ip,
+            details={"query_name": qname, "query_type": qtype},
+        ))
+        log.info("DNS query from %s: %s (%s) — callback_id=%s", source_ip, qname, qtype, callback_id)
+        return build_dns_response(data, qname, qtype, reply_ip)
+    except Exception as exc:
+        log.debug("process_dns_packet error: %s", exc)
+        return None
+
+
+def build_dns_response(query: bytes, qname: str, qtype: str, reply_ip: str) -> bytes:
+    """Build a minimal DNS response: copy the query, set QR=1, append a single
+    A record answer pointing to reply_ip. For non-A queries, return a response
+    with no answers so the caller knows we received it."""
+    header = bytearray(query[:12])
+    header[2] |= 0x80  # QR=1
+    header[3] |= 0x80  # RA=1
+    ancount = 0
+    answer_section = b""
+    if qtype == "A":
+        ancount = 1
+        answer_section = (
+            b"\xc0\x0c"
+            b"\x00\x01"
+            b"\x00\x01"
+            b"\x00\x00\x00\x3c"
+            b"\x00\x04"
+            + bytes(int(p) for p in reply_ip.split("."))
+        )
+    elif qtype == "AAAA":
+        ancount = 1
+        answer_section = (
+            b"\xc0\x0c\x00\x1c\x00\x01\x00\x00\x00\x3c\x00\x10"
+            + b"\x00" * 16
+        )
+    header[6:8] = ancount.to_bytes(2, "big")
+    header[8:10] = (0).to_bytes(2, "big")
+    header[10:12] = (0).to_bytes(2, "big")
+    return bytes(header) + query[12:] + answer_section
 
 
 class DNSServer(socketserver.ThreadingUDPServer):
@@ -269,6 +318,52 @@ def make_dns_server(store: CallbackStore, base_domain: str, reply_ip: str,
     _Handler.base_domain = base_domain
     _Handler.reply_ip = reply_ip
     server = DNSServer((host, port), _Handler)
+    return server
+
+
+class DNSTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class TCPDNSHandler(socketserver.BaseRequestHandler):
+    """TCP DNS server. DNS over TCP prepends each message with a 2-byte length."""
+
+    def handle(self) -> None:
+        sock = self.request
+        length_bytes = self._recv_exact(sock, 2)
+        if len(length_bytes) < 2:
+            return
+        length = int.from_bytes(length_bytes, "big")
+        data = self._recv_exact(sock, length)
+        resp = process_dns_packet(
+            self.server.store, self.server.base_domain, self.server.reply_ip,
+            data, self.client_address[0],
+        )
+        if resp is not None:
+            try:
+                sock.sendall(len(resp).to_bytes(2, "big") + resp)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _recv_exact(sock: Any, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+
+def make_dns_tcp_server(store: CallbackStore, base_domain: str, reply_ip: str,
+                        host: str = "0.0.0.0", port: int = 53) -> DNSTCPServer:
+    """Build a configured DNS-over-TCP server instance (C10)."""
+    server = DNSTCPServer((host, port), TCPDNSHandler)
+    server.store = store
+    server.base_domain = base_domain
+    server.reply_ip = reply_ip
     return server
 
 
@@ -307,11 +402,22 @@ class HTTPCallbackHandler(BaseHTTPRequestHandler):
         self.store.add(cb)
         log.info("HTTP %s from %s: %s %s — callback_id=%s",
                  self.command, self.client_address[0], self.command, self.path, callback_id)
-        # Special path: /callbacks/<id> → return that callback's hits as JSON
-        if self.path.startswith("/callbacks/"):
-            cid = self.path[len("/callbacks/"):]
-            hits = [asdict(c) for c in self.store.get(cid)]
-            payload = json.dumps({"callback_id": cid, "hits": hits}).encode("utf-8")
+        # State API: /callbacks[/<id>][?since=&until=&limit=]  (C11)
+        if self.path.startswith("/callbacks"):
+            parsed = urllib.parse.urlparse(self.path)
+            rest = parsed.path[len("/callbacks"):]
+            cid = rest[1:] if rest.startswith("/") else ""
+            params = urllib.parse.parse_qs(parsed.query)
+            since = params.get("since", [None])[0]
+            until = params.get("until", [None])[0]
+            limit = int(params.get("limit", ["0"])[0] or 0) or None
+            if cid:
+                hits = [asdict(c) for c in self.store.query(
+                    callback_id=cid, since=since, until=until, limit=limit)]
+            else:
+                hits = [asdict(c) for c in self.store.query(
+                    since=since, until=until, limit=limit)]
+            payload = json.dumps({"callback_id": cid or None, "hits": hits}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -360,10 +466,13 @@ def main() -> int:
     ap.add_argument("--base-domain", required=True, help="wildcard DNS base domain, e.g. oob.yourdomain.com")
     ap.add_argument("--state-file", default="oob_state.json", help="JSON state file path")
     ap.add_argument("--dns-port", type=int, default=53)
+    ap.add_argument("--tcp-dns-port", type=int, default=None,
+                   help="also start a DNS-over-TCP server on this port (C10)")
     ap.add_argument("--http-port", type=int, default=80)
     ap.add_argument("--api-port", type=int, default=8080, help="state API port (HTTP server also serves /callbacks/<id>)")
     ap.add_argument("--reply-ip", default="127.0.0.1", help="IP to reply with for DNS A queries (default 127.0.0.1)")
     ap.add_argument("--retention-hours", type=int, default=24)
+    ap.add_argument("--webhook-url", default=None, help="POST each callback as JSON to this URL (C12)")
     ap.add_argument("--no-dns", action="store_true", help="skip DNS server (HTTP-only mode)")
     ap.add_argument("--no-http", action="store_true", help="skip HTTP server (DNS-only mode)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -374,7 +483,8 @@ def main() -> int:
         format="[%(levelname)s] %(message)s",
     )
 
-    store = CallbackStore(Path(args.state_file), retention_hours=args.retention_hours)
+    store = CallbackStore(Path(args.state_file), retention_hours=args.retention_hours,
+                          webhook_url=args.webhook_url)
 
     servers: list[Any] = []
     threads: list[threading.Thread] = []
@@ -392,6 +502,21 @@ def main() -> int:
             return 2
         except OSError as exc:
             log.error("cannot bind DNS port %d — %s", args.dns_port, exc)
+            return 2
+
+    if args.tcp_dns_port:
+        try:
+            tcp_dns = make_dns_tcp_server(
+                store, args.base_domain, args.reply_ip, port=args.tcp_dns_port)
+            servers.append(tcp_dns)
+            t = threading.Thread(target=tcp_dns.serve_forever, daemon=True, name="dns-tcp")
+            threads.append(t)
+            log.info("DNS-over-TCP server listening on :%d", args.tcp_dns_port)
+        except PermissionError:
+            log.error("cannot bind TCP DNS port %d — need root?", args.tcp_dns_port)
+            return 2
+        except OSError as exc:
+            log.error("cannot bind TCP DNS port %d — %s", args.tcp_dns_port, exc)
             return 2
 
     if not args.no_http:

@@ -139,6 +139,21 @@ _VUE_ROUTER_OBJ_RE = re.compile(
 )
 # Vue: this.$router.push("/path") — same as Nuxt
 
+# ── SvelteKit / Remix / Astro route extraction ────────────────────────────────
+
+# SvelteKit: goto("/path") (from @sveltejs/kit) + <a href="/path">
+_SVELTE_GOTO_RE = re.compile(r'\bgoto\s*\(\s*(["\'])(/[a-zA-Z0-9_:/\-\.]+)\1')
+_SVELTE_AHREF_RE = re.compile(r'<\s*a[^>]+href\s*=\s*(["\'])(/[a-zA-Z0-9_:/\-\.]+)\1', re.I)
+
+# Remix: redirect("/path") (from @remix-run) + <Link to="/path">
+_REMIX_REDIRECT_RE = re.compile(r'\bredirect\s*\(\s*(["\'])(/[a-zA-Z0-9_:/\-\.]+)\1')
+_REMIX_LINK_RE = re.compile(
+    r'<\s*Link\b[^>]*\bto\s*=\s*(["\'])(/[a-zA-Z0-9_:/\-\.]+)\1', re.I)
+
+# Astro: <a href="/path"> in .astro templates + Astro.redirect("/path")
+_ASTRO_AHREF_RE = re.compile(r'<\s*a[^>]+href\s*=\s*(["\'])(/[a-zA-Z0-9_:/\-\.]+)\1', re.I)
+_ASTRO_REDIRECT_RE = re.compile(r'\bAstro\.redirect\s*\(\s*(["\'])(/[a-zA-Z0-9_:/\-\.]+)\1')
+
 # ── Vite / generic manifest.json ─────────────────────────────────────────────
 
 # PWA manifest.json: start_url + scope
@@ -307,6 +322,134 @@ def extract_routes_manifest(manifest_json: str, source_url: str) -> list[Route]:
     return out
 
 
+def extract_routes_svelte(js: str, source_url: str) -> list[Route]:
+    """Extract routes from SvelteKit source (goto + anchor hrefs)."""
+    out: list[Route] = []
+    for m in _SVELTE_GOTO_RE.finditer(js):
+        out.append(Route(
+            path=m.group(2), framework="svelte",
+            source=source_url, pattern="goto('/...')",
+            line=js[:m.start()].count("\n") + 1,
+        ))
+    for m in _SVELTE_AHREF_RE.finditer(js):
+        out.append(Route(
+            path=m.group(2), framework="svelte",
+            source=source_url, pattern="<a href='/...'>",
+            line=js[:m.start()].count("\n") + 1,
+        ))
+    return out
+
+
+def extract_routes_remix(js: str, source_url: str) -> list[Route]:
+    """Extract routes from Remix source (redirect + <Link to=...>)."""
+    out: list[Route] = []
+    for m in _REMIX_REDIRECT_RE.finditer(js):
+        out.append(Route(
+            path=m.group(2), framework="remix",
+            source=source_url, pattern="redirect('/...')",
+            line=js[:m.start()].count("\n") + 1,
+        ))
+    for m in _REMIX_LINK_RE.finditer(js):
+        out.append(Route(
+            path=m.group(2), framework="remix",
+            source=source_url, pattern="<Link to='/...'>",
+            line=js[:m.start()].count("\n") + 1,
+        ))
+    return out
+
+
+def extract_routes_astro(js: str, source_url: str) -> list[Route]:
+    """Extract routes from Astro source (anchor hrefs + Astro.redirect)."""
+    out: list[Route] = []
+    for m in _ASTRO_AHREF_RE.finditer(js):
+        out.append(Route(
+            path=m.group(2), framework="astro",
+            source=source_url, pattern="<a href='/...'>",
+            line=js[:m.start()].count("\n") + 1,
+        ))
+    for m in _ASTRO_REDIRECT_RE.finditer(js):
+        out.append(Route(
+            path=m.group(2), framework="astro",
+            source=source_url, pattern="Astro.redirect('/...')",
+            line=js[:m.start()].count("\n") + 1,
+        ))
+    return out
+
+
+_SOURCE_MAP_RE = re.compile(r'//#\s*sourceMappingURL=(\S+)')
+
+
+def find_sourcemap_url(js_content: str, js_url: str) -> str | None:
+    """Return the resolved .map URL referenced by a JS file, or None.
+
+    Handles relative (resolved against the JS URL's directory), absolute, and
+    inline (data:) comments (the latter returns None — its sourcesContent is
+    already embedded in the bundle and handled by the normal extractors).
+    """
+    m = _SOURCE_MAP_RE.search(js_content)
+    if not m:
+        return None
+    val = m.group(1).strip().strip('"\'')
+    if val.startswith("data:"):
+        return None
+    if val.startswith("http://") or val.startswith("https://"):
+        return val
+    base = js_url.rsplit("/", 1)[0]
+    return (base + "/" + val) if base else val
+
+
+def _route_from_source_path(src: str) -> str | None:
+    """Derive a web route path from a file-based routing source path.
+
+    e.g. 'src/routes/admin/settings/+page.svelte' → '/admin/settings'.
+    """
+    s = src.replace("\\", "/")
+    for marker in ("/routes/", "/pages/", "/app/", "/src/"):
+        idx = s.find(marker)
+        if idx != -1:
+            seg = s[idx + len(marker):]
+            break
+    else:
+        return None
+    seg = re.sub(r"\.(svelte|astro|vue|tsx|ts|jsx|js)$", "", seg)
+    seg = seg.replace("+page", "").replace("+layout", "").replace("+server", "")
+    seg = re.sub(r"(^|/)index(/|$)", "/", seg)
+    seg = seg.replace("//", "/")
+    if not seg.startswith("/"):
+        seg = "/" + seg
+    seg = seg.rstrip("/") or "/"
+    return seg
+
+
+def extract_routes_from_sourcemap(map_json: str, source_url: str) -> list[Route]:
+    """Extract routes from a parsed sourcemap.
+
+    Two strategies (both pure, no network):
+      1. File-based route derivation from `sources` entries.
+      2. Runnable route regexes over `sourcesContent` originals.
+    """
+    out: list[Route] = []
+    try:
+        data = json.loads(map_json)
+    except Exception:
+        return out
+    if not isinstance(data, dict):
+        return out
+    for src in (data.get("sources") or []):
+        if not isinstance(src, str):
+            continue
+        route = _route_from_source_path(src)
+        if route:
+            out.append(Route(
+                path=route, framework="sourcemap",
+                source=source_url, pattern=f"sourcemap:sources:{src}",
+            ))
+    for content in (data.get("sourcesContent") or []):
+        if isinstance(content, str):
+            out.extend(extract_all_routes_from_js(content, source_url))
+    return out
+
+
 def detect_framework(js_url: str, js_content: str) -> str | None:
     """Quick heuristic to detect the SPA framework from a JS file's content + URL.
     Returns 'next' | 'nuxt' | 'react-router' | 'vue-router' | 'vite' | 'cra' | None.
@@ -317,6 +460,12 @@ def detect_framework(js_url: str, js_content: str) -> str | None:
         return "next"
     if "/_nuxt/" in u or "__NUXT__" in c or "$router" in c:
         return "nuxt"
+    if "@sveltejs" in c.lower() or ("svelte" in c.lower() and "goto" in c):
+        return "svelte"
+    if "@remix-run" in c.lower() or "remix" in c.lower() and "useLoaderData" in c:
+        return "remix"
+    if "astro" in c.lower() and ("Astro." in c or "client:" in c):
+        return "astro"
     if "react-router" in c or "reactrouter" in c or "<Route " in c or "useNavigate" in c:
         return "react-router"
     if "vue-router" in c or "vuerouter" in c or "$route.path" in c:
@@ -338,6 +487,9 @@ def extract_all_routes_from_js(js_content: str, js_url: str) -> list[Route]:
     out.extend(extract_routes_nuxt_html(js_content, js_url))
     out.extend(extract_routes_react_router(js_content, js_url))
     out.extend(extract_routes_vue_router(js_content, js_url))
+    out.extend(extract_routes_svelte(js_content, js_url))
+    out.extend(extract_routes_remix(js_content, js_url))
+    out.extend(extract_routes_astro(js_content, js_url))
     # If we know the framework, tag routes that didn't have one set
     for r in out:
         if r.framework == "unknown" and framework:
@@ -425,6 +577,21 @@ async def scan_all(assets: list[dict[str, Any]], guard: scope_guard.ScopeGuard,
             if "<html" in body.lower()[:500] or "<!doctype html" in body.lower()[:500]:
                 routes.extend(extract_routes_next_html(body, url))
                 routes.extend(extract_routes_nuxt_html(body, url))
+            # Sourcemap-aware extraction: follow //# sourceMappingURL= and mine
+            # the original (unminified) sources for routes we'd otherwise miss.
+            sm_url = find_sourcemap_url(body, url)
+            if sm_url:
+                try:
+                    guard.check_url(sm_url, source_tool="spa_router.py")
+                except scope_guard.ScopeError:
+                    sm_url = None
+                if sm_url and guard.acquire_token(timeout=20.0):
+                    try:
+                        st, sm_body, _ = await fetch_url(sm_url)
+                        if st and sm_body:
+                            routes.extend(extract_routes_from_sourcemap(sm_body, url))
+                    finally:
+                        guard.release_token()
             log.info("  %s: %d routes", url, len(routes))
             return routes
 

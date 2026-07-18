@@ -31,7 +31,7 @@ def test_detect_contexts_html_body():
 def test_detect_contexts_html_attribute():
     body = '<input value="xssprobeabc12345">'
     ctxs = _detect_contexts("xssprobeabc12345", body)
-    assert "html_attribute" in ctxs
+    assert 'html_attribute_"' in ctxs
 
 
 def test_detect_contexts_script_block():

@@ -9,11 +9,18 @@ on a live target without hand-fed seed lists:
     python scripts/scan.py --url https://target.example.com
 
 Steps:
-  1. Crawl the target (toolkit/infra/spider.py) to discover endpoints + params.
-  2. Run SQL injection tests (toolkit/testers/sqli.py) on every param.
-  3. Run context-aware XSS verification (toolkit/verify/xss_context.py) on
-     query-injected params.
-  4. Aggregate normalized findings and emit JSON + (optional) reports.
+   1. Crawl the target (toolkit/infra/spider.py) to discover endpoints + params.
+   2. Run injection-class detectors on every param:
+        - SQLi        (toolkit/testers/sqli.py)
+        - Command     (toolkit/testers/cmdi.py)
+        - LFI/Traversal (toolkit/testers/lfi.py)
+        - SSTI        (toolkit/testers/ssti.py)
+        - OpenRedirect (toolkit/testers/openredirect.py)
+        - CORS        (toolkit/testers/cors.py)
+        - CSRF        (toolkit/testers/csrf.py, heuristic)
+   3. Run context-aware XSS verification (toolkit/verify/xss_context.py) on
+      query-injected params.
+   4. Aggregate normalized findings and emit JSON + (optional) reports.
 
 Authorized penetration testing / bug bounty research only.
 """
@@ -36,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from toolkit.infra import spider, scope_guard, logfmt
-    from toolkit.testers import sqli
+    from toolkit.testers import (sqli, cmdi, lfi, ssti, openredirect, cors, csrf)
     from toolkit.verify import xss_context
     _HAVE_TOOLKIT = True
 except Exception as exc:  # pragma: no cover
@@ -79,12 +86,34 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
 
         findings: list[dict[str, Any]] = []
 
-        # SQLi
+        # P0 — SQLi
         sqli_res = await sqli.run_sqli(endpoints, client,
                                         timeout=args.timeout,
                                         concurrency=args.concurrency)
         log.info("SQLi findings: %d", len(sqli_res))
         findings.extend(sqli.to_normalized_findings(sqli_res))
+
+        # P1 — injection-class detectors
+        for mod, runner in (
+            (cmdi, cmdi.run_cmdi),
+            (lfi, lfi.run_lfi),
+            (ssti, ssti.run_ssti),
+            (openredirect, openredirect.run_openredirect),
+            (cors, cors.run_cors),
+        ):
+            try:
+                res = await runner(endpoints, client, timeout=args.timeout,
+                                   concurrency=args.concurrency)
+                log.info("%s findings: %d", mod.__name__, len(res))
+                findings.extend(mod.to_normalized_findings(res))
+            except Exception as exc:  # pragma: no cover
+                log.warning("%s failed: %s", mod.__name__, exc)
+
+        # P1 — CSRF heuristic (POST endpoints, no I/O needed)
+        csrf_res = await csrf.run_csrf(endpoints, client,
+                                       concurrency=args.concurrency)
+        log.info("CSRF (possible-missing) candidates: %d", len(csrf_res))
+        findings.extend(csrf.to_normalized_findings(csrf_res))
 
         # XSS (query-injected params only)
         if not args.no_xss:

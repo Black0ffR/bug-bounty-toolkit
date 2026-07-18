@@ -31,6 +31,7 @@ from typing import Any
 
 try:
     from toolkit.infra.finding import NormalizedFinding, compute_finding_id
+    from toolkit.infra import inject
     _HAVE_FINDING = True
 except Exception:  # pragma: no cover
     _HAVE_FINDING = False
@@ -102,8 +103,7 @@ async def _send(client, endpoint: Any, param: str, value: str,
                                      "Content-Type": "application/json"},
                                      json={param: value}, timeout=timeout)
         else:
-            sep = "&" if "?" in url else "?"
-            full = f"{url}{sep}{param}={value}"
+            full = inject.build_injection_url(url, param, value)
             r = await client.request(method, full, headers=headers, timeout=timeout)
         body = getattr(r, "text", "") or ""
         status = int(getattr(r, "status_code", 0) or 0)

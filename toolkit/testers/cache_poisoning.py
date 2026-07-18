@@ -62,6 +62,12 @@ COMMON_UNKEYED_HEADERS = [
     "Forwarded", "X-Real-IP", "True-Client-IP", "X-HTTP-Method-Override",
 ]
 
+# Query params that CDNs/origins frequently exclude from the cache key (C25).
+COMMON_UNKEYED_PARAMS = [
+    "utm_source", "ref", "callback", "return", "next", "lang", "country",
+    "x-cache-bust", "cb", "debug",
+]
+
 _MARKER_RE = re.compile(r"[A-Za-z0-9]{16}")
 
 
@@ -82,6 +88,7 @@ class PoisonResult:
     poisoned_len: int
     followup_len: int
     baseline_len: int
+    kind: str = "header"          # "header" | "param" — C25: also test query params
 
     @property
     def poisoned(self) -> bool:
@@ -102,20 +109,22 @@ def detect_poisoning(baseline_text: str, poisoned_text: str, followup_text: str,
 
 
 def build_result(header: str, marker: str, baseline: str, poisoned: str,
-                 followup: str) -> PoisonResult:
+                 followup: str, kind: str = "header") -> PoisonResult:
     reflected, served = detect_poisoning(baseline, poisoned, followup, marker)
     return PoisonResult(header=header, marker=marker,
                         reflected_in_poisoned=reflected,
                         served_in_followup=served,
                         poisoned_len=len(poisoned), followup_len=len(followup),
-                        baseline_len=len(baseline))
+                        baseline_len=len(baseline), kind=kind)
 
 
 # ── Live checker ─────────────────────────────────────────────────────────────
 
 async def check_url(url: str, headers_to_try: list[str] | None = None,
-                   *, client=None, marker: str | None = None) -> list[PoisonResult]:
-    """Send the 3-request probe for each candidate header. `client` is an
+                    params_to_try: list[str] | None = None,
+                    *, client=None, marker: str | None = None) -> list[PoisonResult]:
+    """Send the 3-request probe for each candidate header (and, when
+    `params_to_try` is given, each candidate query param — C25). `client` is an
     httpx.AsyncClient (or any object with a `.get(url, headers=...)` async
     coroutine returning an object with `.text`)."""
     import httpx
@@ -126,7 +135,9 @@ async def check_url(url: str, headers_to_try: list[str] | None = None,
 
     results: list[PoisonResult] = []
     try:
-        headers_to_try = headers_to_try or COMMON_UNKEYED_HEADERS
+        if headers_to_try is None:
+            headers_to_try = COMMON_UNKEYED_HEADERS
+        params_to_try = params_to_try or []
         baseline_resp = await client.get(url)
         baseline_text = baseline_resp.text
         for header in headers_to_try:
@@ -135,6 +146,17 @@ async def check_url(url: str, headers_to_try: list[str] | None = None,
             followup_resp = await client.get(url)
             results.append(build_result(
                 header, mk, baseline_text, poisoned_resp.text, followup_resp.text))
+        # C25: unkeyed query-param probing — same 3-request primitive but the
+        # marker rides in a query parameter instead of a header.
+        sep = "&" if "?" in url else "?"
+        for p in params_to_try:
+            mk = marker or _random_marker()
+            poisoned_url = f"{url}{sep}{p}={mk}"
+            poisoned_resp = await client.get(poisoned_url)
+            followup_resp = await client.get(url)
+            results.append(build_result(
+                p, mk, baseline_text, poisoned_resp.text, followup_resp.text,
+                kind="param"))
     finally:
         if own_client:
             await client.aclose()
@@ -153,8 +175,9 @@ def to_normalized(url: str, results: list[PoisonResult],
     for r in results:
         if not r.poisoned:
             continue
+        vector_label = f"{r.kind} {r.header}"
         fid = compute_finding_id(source_tool, host, "CACHE_POISONING",
-                                 f"{r.header}:{r.marker}")
+                                 f"{r.kind}:{r.header}:{r.marker}")
         out.append({
             "id": fid,
             "source_tool": source_tool,
@@ -162,12 +185,12 @@ def to_normalized(url: str, results: list[PoisonResult],
             "url": url,
             "vuln_class_key": "CACHE_POISONING",
             "severity": "HIGH",
-            "title": f"Web Cache Poisoning via unkeyed header {r.header}",
-            "detail": f"Header `{r.header}` is unkeyed and the response was cached; "
-                      f"marker `{r.marker}` was reflected and then served to a "
-                      f"header-less follow-up request.",
-            "evidence": f"header={r.header} marker={r.marker}",
-            "raw": {"header": r.header, "marker": r.marker,
+            "title": f"Web Cache Poisoning via unkeyed {vector_label}",
+            "detail": f"{r.kind.capitalize()} `{r.header}` is unkeyed and the response "
+                      f"was cached; marker `{r.marker}` was reflected and then served "
+                      f"to a header-less follow-up request.",
+            "evidence": f"{r.kind}={r.header} marker={r.marker}",
+            "raw": {"header": r.header, "kind": r.kind, "marker": r.marker,
                     "baseline_len": r.baseline_len, "poisoned_len": r.poisoned_len,
                     "followup_len": r.followup_len},
             "confidence": "confirmed",
@@ -183,6 +206,10 @@ def main() -> int:
     ap.add_argument("--url", "-u", required=True)
     ap.add_argument("--header", action="append", dest="headers",
                     help="specific header to test (repeatable); default = common set")
+    ap.add_argument("--unkeyed-params", action="store_true",
+                    help="also test common unkeyed query params (C25)")
+    ap.add_argument("--param", action="append", dest="params",
+                    help="specific query param to test (repeatable)")
     ap.add_argument("--marker", help="fixed marker (else random)")
     ap.add_argument("--output", "-o", default="cache-poisoning-findings.json")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -191,15 +218,16 @@ def main() -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="[%(levelname)s] %(message)s")
 
+    params_to_try = args.params or (COMMON_UNKEYED_PARAMS if args.unkeyed_params else None)
     import asyncio
     results = asyncio.run(check_url(
-        args.url, args.headers, marker=args.marker))
+        args.url, args.headers, params_to_try, marker=args.marker))
 
     confirmed = [r for r in results if r.poisoned]
     for r in results:
         status = "POISONED" if r.poisoned else (
             "reflected-only" if r.reflected_in_poisoned else "clean")
-        log.info("%-22s -> %s", r.header, status)
+        log.info("%-22s [%s] -> %s", r.header, r.kind, status)
 
     norm = to_normalized(args.url, results)
     out_path = Path(args.output)

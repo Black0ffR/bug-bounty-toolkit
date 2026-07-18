@@ -593,6 +593,84 @@ def check_jwt(token: str) -> SecretCheck:
     )
 
 
+# ── Provider registry ──────────────────────────────────────────────────────────
+# C6: a data-driven provider registry so each provider's read-only check is
+# registered in one place (instead of a hard-coded if/elif chain) and can be
+# extended or overridden by callers via register_provider(). "Entry points":
+# list_providers() exposes the registered set; register_provider() adds new
+# providers (or overrides built-ins) without editing the dispatch logic.
+
+PROVIDER_HANDLERS: dict[str, Any] = {}        # exact provider name -> async handler
+PROVIDER_PREFIX_HANDLERS: dict[str, Any] = {}  # name prefix -> async handler
+
+
+def register_provider(name: str, handler, *, prefix: bool = False) -> None:
+    """Register (or override) a provider's verify handler. `prefix=True` makes
+    the handler match any provider name starting with `name` (e.g. 'slack')."""
+    (PROVIDER_PREFIX_HANDLERS if prefix else PROVIDER_HANDLERS)[name] = handler
+
+
+def list_providers() -> list[str]:
+    """Return the sorted list of registered provider names (exact + prefix)."""
+    return sorted(set(PROVIDER_HANDLERS) | set(PROVIDER_PREFIX_HANDLERS))
+
+
+def resolve_provider_handler(provider: str | None) -> Any:
+    """Return the handler for a provider name, or None if unregistered."""
+    if not provider:
+        return None
+    if provider in PROVIDER_HANDLERS:
+        return PROVIDER_HANDLERS[provider]
+    for pfx, fn in PROVIDER_PREFIX_HANDLERS.items():
+        if provider.startswith(pfx):
+            return fn
+    return None
+
+
+# Unified handler signature: async (value, *, paired_secret=None) -> SecretCheck
+async def _h_aws(value, *, paired_secret=None):
+    return await check_aws(value, secret_key=paired_secret)
+
+
+async def _h_aws_secret(value, *, paired_secret=None):
+    return SecretCheck(
+        raw_value=value, provider="aws_secret_access_key",
+        is_live=False, identity="",
+        detail="AWS secret access key without the access key ID — cannot SigV4-sign.",
+        redacted_value=_redact(value),
+    )
+
+
+async def _h_github(value, *, paired_secret=None):
+    return await check_github(value)
+
+
+async def _h_slack(value, *, paired_secret=None):
+    return await check_slack(value)
+
+
+async def _h_stripe(value, *, paired_secret=None):
+    return await check_stripe(value)
+
+
+async def _h_google(value, *, paired_secret=None):
+    return await check_google_api_key(value)
+
+
+async def _h_jwt(value, *, paired_secret=None):
+    return check_jwt(value)
+
+
+register_provider("aws_access_key_id", _h_aws)
+register_provider("aws_secret_access_key", _h_aws_secret)
+register_provider("github_pat", _h_github)
+register_provider("github_legacy_token", _h_github)
+register_provider("google_api_key", _h_google)
+register_provider("jwt", _h_jwt)
+register_provider("slack", _h_slack, prefix=True)
+register_provider("stripe", _h_stripe, prefix=True)
+
+
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
 async def verify_secret(value: str, *, provider_hint: str = "",
@@ -615,34 +693,16 @@ async def verify_secret(value: str, *, provider_hint: str = "",
             detail="no provider pattern matched — skipping.",
             redacted_value=_redact(value),
         )
-    if provider == "aws_access_key_id":
-        # AWS needs both access_key_id and secret — use a paired secret if present
-        return await check_aws(value, secret_key=paired_secret)
-    if provider == "github_pat" or provider == "github_legacy_token":
-        return await check_github(value)
-    if provider.startswith("slack"):
-        return await check_slack(value)
-    if provider.startswith("stripe"):
-        return await check_stripe(value)
-    if provider == "google_api_key":
-        return await check_google_api_key(value)
-    if provider == "jwt":
-        return check_jwt(value)
-    # AWS secret access key alone — can't verify
-    if provider == "aws_secret_access_key":
+    handler = resolve_provider_handler(provider)
+    if handler is None:
+        # Other providers (gitlab, twilio) — TODO; for now, treat as candidate
         return SecretCheck(
             raw_value=value, provider=provider,
             is_live=False, identity="",
-            detail="AWS secret access key without the access key ID — cannot SigV4-sign.",
+            detail=f"no read-only check implemented for {provider} yet — flagging as candidate.",
             redacted_value=_redact(value),
         )
-    # Other providers (gitlab, twilio) — TODO; for now, treat as candidate
-    return SecretCheck(
-        raw_value=value, provider=provider,
-        is_live=False, identity="",
-        detail=f"no read-only check implemented for {provider} yet — flagging as candidate.",
-        redacted_value=_redact(value),
-    )
+    return await handler(value, paired_secret=paired_secret)
 
 
 async def verify_all(secrets: list[dict[str, Any]], guard: scope_guard.ScopeGuard | None,

@@ -599,6 +599,20 @@ def check_url(url: str, *, source_tool: str = "") -> None:
     get_default().check_url(url, source_tool=source_tool)
 
 
+def map_scope(guard: ScopeGuard, hosts: list[str]) -> list[dict[str, str]]:
+    """C15: resolve a list of hosts against the scope guard, returning per-host
+    IN/OUT status. Useful for auditing what a scope.yaml actually covers
+    (including CIDR-based exclusions) before a run."""
+    out: list[dict[str, str]] = []
+    for host in hosts:
+        try:
+            guard.check_scope(host, source_tool="scope_guard.map")
+            out.append({"host": host, "status": "IN", "reason": ""})
+        except ScopeError as exc:
+            out.append({"host": host, "status": "OUT", "reason": str(exc)})
+    return out
+
+
 def acquire_token(timeout: float = 60.0) -> bool:
     return get_default().acquire_token(timeout)
 
@@ -608,16 +622,29 @@ def release_token() -> None:
 
 
 if __name__ == "__main__":
-    # Smoke-test CLI: python -m toolkit.infra.scope_guard scope.yaml www.acme.com evil.com
+    # Smoke-test CLI:
+    #   python -m toolkit.infra.scope_guard scope.yaml www.acme.com evil.com
+    #   python -m toolkit.infra.scope_guard map scope.yaml host1 host2 ...
     import sys
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-    if len(sys.argv) < 2:
-        print("usage: scope_guard.py <scope.yaml> [host ...]", file=sys.stderr)
+    argv = sys.argv[1:]
+    if len(argv) < 2:
+        print("usage: scope_guard.py [map] <scope.yaml> [host ...]", file=sys.stderr)
         sys.exit(2)
-    guard = ScopeGuard(sys.argv[1])
-    for host in sys.argv[2:]:
-        try:
-            guard.check_scope(host, source_tool="scope_guard.py")
-            print(f"OK   {host}")
-        except ScopeError as exc:
-            print(f"FAIL {host}  ({exc})")
+    if argv[0] == "map":
+        guard = ScopeGuard(argv[1])
+        rows = map_scope(guard, argv[2:])
+        in_n = sum(1 for r in rows if r["status"] == "IN")
+        for r in rows:
+            mark = "IN " if r["status"] == "IN" else "OUT"
+            extra = f"  ({r['reason']})" if r["reason"] else ""
+            print(f"{mark}  {r['host']}{extra}")
+        print(f"\n{in_n}/{len(rows)} hosts IN scope")
+    else:
+        guard = ScopeGuard(argv[0])
+        for host in argv[1:]:
+            try:
+                guard.check_scope(host, source_tool="scope_guard.py")
+                print(f"OK   {host}")
+            except ScopeError as exc:
+                print(f"FAIL {host}  ({exc})")

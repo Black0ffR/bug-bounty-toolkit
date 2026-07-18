@@ -59,6 +59,7 @@ def build_client(
     timeout: float = 30.0,
     limits: httpx.Limits | None = None,
     headers: dict[str, str] | None = None,
+    proxy: str | None = None,
 ) -> httpx.AsyncClient:
     """Construct a configured AsyncClient. Pure factory — no I/O, safe to test."""
     return httpx.AsyncClient(
@@ -67,6 +68,7 @@ def build_client(
         timeout=timeout,
         limits=limits or DEFAULT_LIMITS,
         headers=headers or DEFAULT_HEADERS,
+        proxy=proxy,
     )
 
 
@@ -85,6 +87,7 @@ async def get_shared_client(
     timeout: float = 30.0,
     limits: httpx.Limits | None = None,
     headers: dict[str, str] | None = None,
+    proxy: str | None = None,
 ) -> httpx.AsyncClient:
     """Return the shared AsyncClient for the current event loop, creating it on
     first use. Subsequent calls in the same loop return the SAME instance
@@ -94,7 +97,7 @@ async def get_shared_client(
     if client is None or client.is_closed:
         client = build_client(
             verify=verify, follow_redirects=follow_redirects,
-            timeout=timeout, limits=limits, headers=headers,
+            timeout=timeout, limits=limits, headers=headers, proxy=proxy,
         )
         _shared_clients[key] = client
     return client

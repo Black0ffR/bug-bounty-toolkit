@@ -49,3 +49,10 @@ def test_close_shared_clients_clears_pool():
         await http_pool.close_shared_clients()
         return len(http_pool._shared_clients)
     assert asyncio.run(go()) == 0
+
+
+def test_build_client_accepts_proxy():
+    # B21: proxy rotation plugs into the shared pool via the proxy arg.
+    c = http_pool.build_client(proxy="http://127.0.0.1:9050")
+    assert isinstance(c, httpx.AsyncClient)
+    assert c._mounts is not None  # type: ignore[attr-defined]

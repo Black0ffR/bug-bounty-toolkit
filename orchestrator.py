@@ -92,6 +92,8 @@ class OrchestratorContext:
     mode: str                    # quick | deep | resume | watch
     run_id: int = 0
     stage_results: list[StageResult] = field(default_factory=list)
+    stages_filter: list[str] | None = None   # B14: explicit subset to run
+    dry_run: bool = False                    # B15: plan only, no execution
     _interrupted: bool = False
 
     def stage_output(self, stage_name: str, suffix: str = ".json") -> Path:
@@ -617,12 +619,50 @@ DEEP_STAGES = [
 ]
 
 
+# Superset of every stage (used for --stages validation and --list-stages).
+ALL_STAGES: dict[str, Any] = dict(DEEP_STAGES)
+
+
+def get_stage_fn(name: str) -> Any:
+    """Return the stage callable for a name, or None if unknown."""
+    return ALL_STAGES.get(name)
+
+
+def resolve_stages(mode: str, stages_filter: list[str] | None = None) -> list[tuple[str, Any]]:
+    """Return the (name, fn) list to execute.
+
+    - If ``stages_filter`` is provided, validate each (case-insensitive) and
+      return them in the requested order (B14: run a subset of stages).
+    - Otherwise fall back to QUICK_STAGES / DEEP_STAGES by mode.
+    """
+    if stages_filter:
+        known = {n.lower(): (n, fn) for n, fn in ALL_STAGES.items()}
+        resolved: list[tuple[str, Any]] = []
+        for s in stages_filter:
+            key = s.strip().lower()
+            if key not in known:
+                raise ValueError(
+                    f"unknown stage: {s!r} (known stages: {', '.join(sorted(ALL_STAGES))})")
+            resolved.append(known[key])
+        return resolved
+    return QUICK_STAGES if mode == "quick" else DEEP_STAGES
+
+
 # ── Main orchestrator ────────────────────────────────────────────────────────
 
 def run_pipeline(ctx: OrchestratorContext) -> int:
     """Execute all stages for this ctx.mode. Returns 0 on full success, 1 on
     any stage failure (but still completes non-dependent stages)."""
-    stages = QUICK_STAGES if ctx.mode == "quick" else DEEP_STAGES
+    try:
+        stages = resolve_stages(ctx.mode, ctx.stages_filter)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+    if ctx.dry_run:
+        log.info("dry-run: planned %d stages for target=%s mode=%s", len(stages), ctx.target, ctx.mode)
+        for i, (name, _fn) in enumerate(stages, start=1):
+            log.info("  [%d] %s", i, name)
+        return 0
     log.info("=" * 70)
     log.info("Orchestrator starting: target=%s mode=%s stages=%d", ctx.target, ctx.mode, len(stages))
     log.info("work_dir=%s", ctx.work_dir)
@@ -698,6 +738,9 @@ def main() -> int:
     ap.add_argument("--quick", action="store_true", help="quick mode: subtakeover + jsreaper + headeraudit only")
     ap.add_argument("--deep", action="store_true", help="deep mode: full 15+ stage pipeline")
     ap.add_argument("--resume", action="store_true", help="resume from last checkpoint (skip stages with existing output)")
+    ap.add_argument("--stages", help="B14: comma-separated subset of stages to run, e.g. jsreaper,headeraudit")
+    ap.add_argument("--list-stages", action="store_true", help="B15: print all available stage names and exit")
+    ap.add_argument("--dry-run", action="store_true", help="B15: print the planned stages without executing them")
     ap.add_argument("--watch", action="store_true", help="hand off to watch_daemon.py — continuous monitoring")
     ap.add_argument("--interval", type=int, default=3600, help="watch interval in seconds (default: 3600)")
     ap.add_argument("--output-dir", default="./work", help="root work directory (default: ./work)")
@@ -717,6 +760,17 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="[%(levelname)s] %(message)s",
     )
+
+    if args.list_stages:
+        print("Available orchestrator stages:")
+        for name in sorted(ALL_STAGES):
+            membership = []
+            if name in dict(QUICK_STAGES):
+                membership.append("quick")
+            if name in dict(DEEP_STAGES):
+                membership.append("deep")
+            print(f"  - {name}  [{','.join(membership) or 'conditional'}]")
+        return 0
 
     if args.watch:
         if not args.scope:
@@ -772,6 +826,9 @@ def main() -> int:
         db_path=Path(args.db),
         mode=mode,
     )
+    if args.stages:
+        ctx.stages_filter = [s for s in args.stages.split(",") if s.strip()]
+    ctx.dry_run = bool(args.dry_run)
     if args.apk_dir:
         ctx.__dict__["apk_dir"] = Path(args.apk_dir)
 

@@ -120,3 +120,14 @@ def test_stage_runs_in_isolation(monkeypatch, tmp_path):
     assert len(calls) == 1
     assert "subtakeover10.py" in calls[0][1]
 
+
+def test_dry_run_respects_stages_subset():
+    """C13: --dry-run planning must honor an explicit --stages subset, returning
+    only the requested stages in the requested order."""
+    stages = orchestrator.resolve_stages("quick", ["jsreaper", "headeraudit"])
+    names = [n for n, _ in stages]
+    assert names == ["jsreaper", "headeraudit"]
+    # And the full quick set is larger than the subset (sanity).
+    full = orchestrator.resolve_stages("quick", None)
+    assert len(full) > len(stages)
+

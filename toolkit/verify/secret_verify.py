@@ -186,6 +186,7 @@ def extract_secrets_from_findings(findings: list[dict[str, Any]]) -> list[dict[s
                     continue
             out.append({
                 "raw_value": value,
+                "provider": _detect_provider(value),
                 "source_tool": raw.get("source_tool", "jsreaper.py"),
                 "host": raw.get("host", ""),
                 "js_url": raw.get("js_url", ""),
@@ -196,8 +197,10 @@ def extract_secrets_from_findings(findings: list[dict[str, Any]]) -> list[dict[s
 
         # recon_pipeline_v4.py-style Secret dataclass
         if "type_" in raw and "value" in raw:
+            rv = raw.get("value", "")
             out.append({
-                "raw_value": raw.get("value", ""),
+                "raw_value": rv,
+                "provider": _detect_provider(rv),
                 "source_tool": raw.get("source_tool", "recon_pipeline_v4.py"),
                 "host": "",
                 "js_url": raw.get("js_file", raw.get("source", "")),
@@ -214,7 +217,33 @@ def extract_secrets_from_findings(findings: list[dict[str, Any]]) -> list[dict[s
             log.debug("js-extractor_3 path entry found — needs jsreaper.py output for raw values; skipping")
             continue
 
+    _pair_aws_keys(out)
     return out
+
+
+def _pair_aws_keys(entries: list[dict[str, Any]]) -> None:
+    """For each `aws_access_key_id` entry, attach the `aws_secret_access_key`
+    found in the same source file (same source_tool + js_url) as `paired_secret`,
+    so check_aws can actually SigV4-sign instead of reporting 'key without secret'.
+
+    A secret entry is consumed by at most one access-key entry; leftover secret
+    entries keep their own (unverifiable) entry."""
+    consumed: set[int] = set()
+    for i, ak in enumerate(entries):
+        if ak.get("provider") != "aws_access_key_id":
+            continue
+        if ak.get("paired_secret"):
+            continue
+        for j, sk in enumerate(entries):
+            if j in consumed:
+                continue
+            if sk.get("provider") != "aws_secret_access_key":
+                continue
+            if (sk.get("source_tool"), sk.get("js_url")) != (ak.get("source_tool"), ak.get("js_url")):
+                continue
+            ak["paired_secret"] = sk["raw_value"]
+            consumed.add(j)
+            break
 
 
 # ── Provider-specific checks (all read-only, all non-mutating) ──────────────
@@ -566,9 +595,11 @@ def check_jwt(token: str) -> SecretCheck:
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
-async def verify_secret(value: str, *, provider_hint: str = "") -> SecretCheck:
+async def verify_secret(value: str, *, provider_hint: str = "",
+                      paired_secret: str | None = None) -> SecretCheck:
     """Dispatch to the right provider check based on the value's pattern.
-    provider_hint overrides auto-detection."""
+    provider_hint overrides auto-detection. paired_secret carries a sibling
+    AWS secret key so aws_access_key_id can actually be verified."""
     if _looks_like_placeholder(value):
         return SecretCheck(
             raw_value=value, provider=provider_hint or "placeholder",
@@ -585,8 +616,8 @@ async def verify_secret(value: str, *, provider_hint: str = "") -> SecretCheck:
             redacted_value=_redact(value),
         )
     if provider == "aws_access_key_id":
-        # AWS needs both access_key_id and secret — we have only the ID
-        return await check_aws(value, secret_key=None)
+        # AWS needs both access_key_id and secret — use a paired secret if present
+        return await check_aws(value, secret_key=paired_secret)
     if provider == "github_pat" or provider == "github_legacy_token":
         return await check_github(value)
     if provider.startswith("slack"):
@@ -621,7 +652,7 @@ async def verify_all(secrets: list[dict[str, Any]], guard: scope_guard.ScopeGuar
 
     async def _one(s: dict[str, Any]) -> tuple[dict[str, Any], SecretCheck]:
         async with sem:
-            check = await verify_secret(s["raw_value"])
+            check = await verify_secret(s["raw_value"], paired_secret=s.get("paired_secret"))
             return (s, check)
 
     return await asyncio.gather(*[_one(s) for s in secrets])

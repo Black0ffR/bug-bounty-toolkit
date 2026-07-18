@@ -12,8 +12,10 @@ from toolkit.verify.secret_verify import (
     _looks_like_placeholder,
     _redact,
     check_jwt,
+    check_aws,
     extract_secrets_from_findings,
     build_verified_findings,
+    verify_secret,
     SecretCheck,
 )
 
@@ -209,3 +211,39 @@ def test_check_github_dead_token_against_mock_server(mock_http_server):
     # If we wired the GitHub check to use base_url, this would return is_live=False
     # For now, just verify the detection works
     assert _detect_provider(pat) == "github_pat"
+
+
+def test_extract_pairs_aws_access_key_with_secret():
+    findings = [
+        {"secret_type": "AWS_KEY", "value": "AKIAIOSFODNN7EXAMPLEKEY", "js_url": "https://x/app.js", "host": "x"},
+        {"secret_type": "AWS_SECRET", "value": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "js_url": "https://x/app.js", "host": "x"},
+    ]
+    secrets = extract_secrets_from_findings(findings)
+    ak = next(s for s in secrets if s["provider"] == "aws_access_key_id")
+    sk = next(s for s in secrets if s["provider"] == "aws_secret_access_key")
+    assert ak["paired_secret"] == sk["raw_value"]
+
+
+def test_extract_no_pair_across_different_sources():
+    findings = [
+        {"secret_type": "AWS_KEY", "value": "AKIAIOSFODNN7EXAMPLEKEY", "js_url": "https://x/a.js"},
+        {"secret_type": "AWS_SECRET", "value": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "js_url": "https://x/b.js"},
+    ]
+    secrets = extract_secrets_from_findings(findings)
+    ak = next(s for s in secrets if s["provider"] == "aws_access_key_id")
+    assert "paired_secret" not in ak
+
+
+def test_verify_secret_passes_paired_aws_secret(monkeypatch):
+    captured = {}
+
+    async def fake_check_aws(access_key, secret_key=None):
+        captured["secret_key"] = secret_key
+        return SecretCheck(raw_value=access_key, provider="aws_access_key_id",
+                           is_live=True, identity="arn", detail="ok", redacted_value="AKIA…")
+    monkeypatch.setattr("toolkit.verify.secret_verify.check_aws", fake_check_aws)
+    res = asyncio.run(verify_secret("AKIAIOSFODNN7REALABCD",
+                                    provider_hint="aws_access_key_id",
+                                    paired_secret="SECRETVALUE123"))
+    assert res.is_live is True
+    assert captured["secret_key"] == "SECRETVALUE123"

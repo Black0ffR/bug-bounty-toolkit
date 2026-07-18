@@ -78,14 +78,18 @@ class ApkFinding:
 
 
 def _parse_manifest(manifest_path: Path) -> list[ApkFinding]:
-    """Parse AndroidManifest.xml for risky component declarations."""
-    out: list[ApkFinding] = []
+    """Parse an AndroidManifest.xml file (apktool output) for risky declarations."""
     try:
         tree = ET.parse(manifest_path)
     except ET.ParseError as exc:
         log.warning("could not parse %s: %s", manifest_path, exc)
-        return out
-    root = tree.getroot()
+        return []
+    return _parse_manifest_root(tree.getroot(), manifest_path)
+
+
+def _parse_manifest_root(root: Any, manifest_path: Path) -> list[ApkFinding]:
+    """Parse an in-memory AndroidManifest root element for risky declarations."""
+    out: list[ApkFinding] = []
     pkg = root.get("package", "?")
     # debuggable
     application = root.find("application")
@@ -235,6 +239,48 @@ def _scan_text_file(path: Path, content: str) -> list[ApkFinding]:
     return out
 
 
+def _import_androguard():
+    """Lazy-import androguard's APK class, or return None if not installed."""
+    try:
+        from androguard.core.apk import APK
+        return APK
+    except Exception:
+        return None
+
+
+def scan_apk_file(apk_file: Path) -> list[ApkFinding]:
+    """Directly analyze a .apk using androguard (no apktool decode step).
+    Raises RuntimeError with an install hint if androguard is unavailable."""
+    APK = _import_androguard()
+    if APK is None:
+        raise RuntimeError(
+            "androguard is required to scan .apk files directly. "
+            "Install it (`pip install androguard`) or decompile first with "
+            "`apktool d app.apk -o app_decoded` and pass --apk-dir."
+        )
+    apk = APK(str(apk_file))
+    findings: list[ApkFinding] = []
+    # 1. Manifest — androguard returns an lxml element; re-parse with stdlib
+    #    so we can reuse the same manifest-parsing logic as the apktool path.
+    try:
+        from lxml import etree as _lxml_etree  # type: ignore
+        manifest_xml = apk.get_android_manifest_xml()
+        manifest_bytes = _lxml_etree.tostring(manifest_xml) if manifest_xml is not None else b""
+        if manifest_bytes:
+            root = ET.fromstring(manifest_bytes)
+            findings.extend(_parse_manifest_root(root, Path(str(apk_file))))
+    except Exception as exc:  # pragma: no cover - depends on androguard
+        log.warning("could not parse manifest from %s: %s", apk_file, exc)
+    # 2. DEX strings — same secret/url patterns as the smali path
+    try:
+        strings = apk.get_strings() or set()
+        content = "\n".join(str(s) for s in strings)
+        findings.extend(_scan_text_file(Path(apk_file.name), content))
+    except Exception as exc:  # pragma: no cover - depends on androguard
+        log.warning("could not extract strings from %s: %s", apk_file, exc)
+    return findings
+
+
 def scan_apk_dir(apk_dir: Path) -> list[ApkFinding]:
     """Scan a decompiled APK directory."""
     findings: list[ApkFinding] = []
@@ -328,30 +374,49 @@ def to_normalized(findings: list[ApkFinding], apk_dir: str = "") -> list[dict[st
     return out
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="apk_static.py",
         description="Android APK static analysis. Conditional stage — run when scope includes mobile.",
     )
-    ap.add_argument("--apk-dir", required=True, help="path to apktool-decoded APK directory")
+    ap.add_argument("--apk-dir", help="path to apktool-decoded APK directory")
+    ap.add_argument("--apk-file", help="path to a .apk file (analyzed directly via androguard)")
     ap.add_argument("--output", "-o", default="apk-findings.json")
     ap.add_argument("--db", default="pipeline_state.db")
     ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="[%(levelname)s] %(message)s",
     )
 
-    apk_dir = Path(args.apk_dir)
-    if not apk_dir.is_dir():
-        log.error("apk-dir not found or not a directory: %s", apk_dir)
+    # Exactly one input source is required.
+    if bool(args.apk_dir) == bool(args.apk_file):
+        log.error("specify exactly one of --apk-dir or --apk-file")
         return 2
 
-    findings = scan_apk_dir(apk_dir)
+    if args.apk_file:
+        apk_file = Path(args.apk_file)
+        if not apk_file.is_file():
+            log.error("apk-file not found: %s", apk_file)
+            return 2
+        try:
+            findings = scan_apk_file(apk_file)
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 2
+        apk_label = str(apk_file)
+    else:
+        apk_dir = Path(args.apk_dir)
+        if not apk_dir.is_dir():
+            log.error("apk-dir not found or not a directory: %s", apk_dir)
+            return 2
+        findings = scan_apk_dir(apk_dir)
+        apk_label = str(apk_dir)
+
     log.info("total findings: %d", len(findings))
-    normalized = to_normalized(findings, apk_dir=str(apk_dir))
+    normalized = to_normalized(findings, apk_dir=apk_label)
 
     state = PipelineState(args.db)
     try:
@@ -364,7 +429,7 @@ def main() -> int:
     out_path.write_text(
         json.dumps({
             "scan_time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-            "apk_dir": str(apk_dir),
+            "apk_dir": apk_label,
             "total_findings": len(normalized),
             "findings": normalized,
         }, indent=2, default=str),

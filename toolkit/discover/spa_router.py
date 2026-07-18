@@ -499,15 +499,14 @@ def extract_all_routes_from_js(js_content: str, js_url: str) -> list[Route]:
 
 async def fetch_url(url: str, *, timeout: float = 15.0) -> tuple[int, str, dict[str, str]]:
     """Fetch a URL and return (status, body, headers). Never raises — returns
-    (0, "", {}) on failure. Uses httpx if available, urllib fallback."""
+    (0, "", {}) on failure. Uses a shared httpx connection pool (B19) when
+    available, urllib fallback otherwise."""
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=timeout, verify=False,
-                                     follow_redirects=True,
-                                     headers={"User-Agent": "Mozilla/5.0 (compatible; SpaRouter/1.0)"}) as c:
-            r = await c.get(url)
-            return (r.status_code, r.text or "", dict(r.headers))
-    except ImportError:
+        from toolkit.infra import http_pool
+        client = await http_pool.get_shared_client(timeout=timeout)
+        r = await client.get(url)
+        return (r.status_code, r.text or "", dict(r.headers))
+    except Exception:
         pass
     # urllib fallback (sync, but wrapped in thread)
     import urllib.request

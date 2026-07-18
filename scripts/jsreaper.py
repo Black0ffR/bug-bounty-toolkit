@@ -1385,11 +1385,18 @@ Feeds into  : apifuzz.py --js, paramfuzz.py --js, ssrfprobe.py --endpoints
                    help="Override the User-Agent header sent on every request (C18)")
     p.add_argument("--log-format", choices=("text", "json"), default="text",
                    help="Log output format (C20)")
+    p.add_argument("--config", metavar="FILE", help="Per-target YAML config (C21)")
     return p.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
+    if args.config:
+        try:
+            from toolkit.infra import config as _config
+            args = _config.overlay_config(args, args.config)
+        except Exception as exc:  # pragma: no cover
+            log.warning(f"[Config] could not load --config: {exc}")
     if _HAVE_LOGFMT:
         _logfmt.configure_logging(
             format=args.log_format,

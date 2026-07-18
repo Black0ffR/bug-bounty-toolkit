@@ -541,7 +541,12 @@ def generate_oob_token(host: str, param: str, payload_cat: str) -> str:
     return token
 
 
-def build_oob_url(token: str, oob_domain: str) -> str:
+def build_oob_url(token: str, oob_domain: str, dns_only: bool = False) -> str:
+    """Build the OOB probe URL for a token.
+
+    When `dns_only` is True the same hostname is used but the caller marks the
+    probe as DNS-resolution-only (some targets egress DNS but not HTTP, so a
+    DNS lookup on `<token>.<oob_domain>` is the observable signal)."""
     return f"http://{token}.{oob_domain}/"
 
 
@@ -606,6 +611,7 @@ class SSRFTester:
         test_obfuscation: bool = True,
         test_schemes: bool = True,
         test_oob: bool = True,
+        oob_dns_only: bool = False,
     ):
         self.domain          = domain
         self.oob_domain      = oob_domain
@@ -616,6 +622,7 @@ class SSRFTester:
         self.test_obfuscation = test_obfuscation
         self.test_schemes    = test_schemes
         self.test_oob        = test_oob and (oob_domain or webhook_url)
+        self.oob_dns_only    = oob_dns_only
         # Token → (host, param, category) for OOB correlation
         self._oob_tokens: dict[str, tuple[str, str, str]] = {}
 
@@ -645,13 +652,15 @@ class SSRFTester:
         if self.test_oob:
             token = generate_oob_token(point.host, point.param_name, "oob")
             oob_url = (
-                build_oob_url(token, self.oob_domain)
+                build_oob_url(token, self.oob_domain, dns_only=self.oob_dns_only)
                 if self.oob_domain
                 else self.webhook_url or ""
             )
             if oob_url:
                 self._oob_tokens[token] = (point.host, point.param_name, "oob")
-                payload_sets.append(("oob", [(oob_url, "Blind OOB SSRF callback")]))
+                desc = ("Blind OOB SSRF callback (DNS-only)"
+                        if self.oob_dns_only else "Blind OOB SSRF callback")
+                payload_sets.append(("oob", [(oob_url, desc)]))
 
         for category, payloads in payload_sets:
             for payload_url, payload_desc in payloads:
@@ -751,12 +760,20 @@ class SSRFTester:
             )
             title = f"Possible Blind SSRF — Timing Anomaly on {point.param_name}"
         else:
-            evidence_detail = (
-                f"OOB payload sent: {payload_url}\n"
-                f"Response: HTTP {status}\n"
-                f"Check OOB listener ({self.oob_domain or self.webhook_url}) "
-                f"for DNS/HTTP callback."
-            )
+            listener = self.oob_domain or self.webhook_url
+            if self.oob_dns_only:
+                evidence_detail = (
+                    f"DNS-only OOB payload sent: {payload_url}\n"
+                    f"Response: HTTP {status}\n"
+                    f"Monitor your DNS listener ({listener}) for a lookup of the "
+                    f"subdomain token — no HTTP callback is expected in DNS-only mode."
+                )
+            else:
+                evidence_detail = (
+                    f"OOB payload sent: {payload_url}\n"
+                    f"Response: HTTP {status}\n"
+                    f"Check OOB listener ({listener}) for DNS/HTTP callback."
+                )
             title = f"Blind SSRF — OOB Payload Delivered via {point.param_name}"
 
         recommendation = (
@@ -1240,6 +1257,9 @@ Output      : JSON + HTML with curl PoC per finding
                    help="OOB callback domain (e.g. abc123.oast.pro from interactsh-client)")
     p.add_argument("--webhook",      metavar="URL",
                    help="Webhook URL for blind OOB detection (e.g. webhook.site URL)")
+    p.add_argument("--oob-dns-only", action="store_true",
+                   help="Emit DNS-resolution-only OOB probes (monitor DNS callbacks, "
+                        "not HTTP) — useful when targets egress DNS but not HTTP")
     p.add_argument("--no-metadata",  action="store_true",
                    help="Skip cloud metadata payloads")
     p.add_argument("--no-internal",  action="store_true",
@@ -1354,6 +1374,7 @@ async def main() -> None:
         test_obfuscation=not args.no_obfuscation,
         test_schemes=not args.no_schemes,
         test_oob=bool(args.oob_domain or args.webhook),
+        oob_dns_only=args.oob_dns_only,
     )
 
     t0 = time.perf_counter()

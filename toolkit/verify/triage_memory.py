@@ -320,9 +320,76 @@ def generate_writeup(finding: NormalizedFinding, *, format: str = "h1") -> str:
     return "\n".join(lines)
 
 
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort clipboard copy. Tries pyperclip then platform CLIs
+    (pbcopy / xclip / termux-clipboard-set). Returns True on success."""
+    try:
+        import pyperclip  # type: ignore
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        pass
+    import shutil
+    import subprocess
+    for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"],
+                ["termux-clipboard-set"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text, text=True, check=False, timeout=5,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _open_url_default(url: str) -> bool:
+    """Best-effort URL open via xdg-open / open / termux-open-url. Returns True
+    if a handler was launched."""
+    import shutil
+    import subprocess
+    for cmd in (["xdg-open"], ["open"], ["termux-open-url"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd + [url], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def format_finding_full(finding: NormalizedFinding) -> str:
+    """Pretty JSON of the full finding record (the `full` inspect action)."""
+    return json.dumps(finding.to_dict(), indent=2, default=str)
+
+
+def copy_finding_field(finding: NormalizedFinding, field: str,
+                       *, _clipboard=None) -> tuple[str, bool]:
+    """Resolve a finding field and copy it to the clipboard. `field` is one of
+    id|url|curl|poc|evidence|title. Returns (value, copied_ok)."""
+    field = (field or "id").lower()
+    if field in ("id",):
+        value = finding.id
+    elif field in ("url",):
+        value = finding.url
+    elif field in ("curl", "poc"):
+        value = finding.curl_command or ""
+    elif field in ("evidence",):
+        value = finding.evidence or ""
+    elif field in ("title",):
+        value = finding.title
+    else:
+        value = ""
+    clip = _clipboard or _copy_to_clipboard
+    ok = bool(value) and clip(value)
+    return value, ok
+
+
 def interactive_triage(entries: list[TriageEntry], state: PipelineState, *,
-                       top: int = 10, writeup_dir: Path | None = None,
-                       decided_by: str = "interactive") -> int:
+                        top: int = 10, writeup_dir: Path | None = None,
+                        decided_by: str = "interactive",
+                        _clipboard=None, _opener=None) -> int:
     """Walk the user through each finding, prompting for disposition.
     Returns count of dispositions recorded."""
     if not entries:
@@ -331,6 +398,7 @@ def interactive_triage(entries: list[TriageEntry], state: PipelineState, *,
     print()
     print(f"  Triage queue: {len(entries)} active findings (showing top {min(top, len(entries))})")
     print(f"  Type one of: review | submit | reject | duplicate <id> | skip | quit")
+    print(f"  Inspect actions (don't record a disposition): open | copy <id|url|curl|evidence|title> | full")
     print(f"  Submitting a finding writes a HackerOne-formatted writeup to {writeup_dir or 'reports/'}")
     print()
     count = 0
@@ -358,6 +426,28 @@ def interactive_triage(entries: list[TriageEntry], state: PipelineState, *,
             if ans in ("q", "quit", "exit"):
                 print("  exiting triage (progress saved to pipeline_state.db)")
                 return count
+            # ── Inspect actions (no disposition recorded) ──
+            if ans in ("o", "open"):
+                opener = _opener or _open_url_default
+                if opener(f.url):
+                    print(f"     ↗ opened {f.url}")
+                else:
+                    print(f"     url: {f.url}")
+                continue
+            if ans.startswith("copy"):
+                parts = ans.split(maxsplit=1)
+                field = parts[1].strip() if len(parts) > 1 else "id"
+                value, ok = copy_finding_field(f, field, _clipboard=_clipboard)
+                if not value:
+                    print(f"     no '{field}' value to copy")
+                elif ok:
+                    print(f"     ✓ copied {field} to clipboard")
+                else:
+                    print(f"     {field}: {value}")
+                continue
+            if ans in ("f", "full"):
+                print(format_finding_full(f))
+                continue
             if ans in ("s", "skip"):
                 break
             if ans in ("r", "review"):

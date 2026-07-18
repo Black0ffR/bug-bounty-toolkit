@@ -58,11 +58,55 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+# ── C29: FTS synonym expansion ────────────────────────────────────────────────
+# Maps a short vuln-class token to its synonyms so a search for "xss" also
+# matches findings that only mention "cross-site scripting" (and vice versa).
+
+_FTS_SYNONYMS: dict[str, list[str]] = {
+    "xss": ["cross-site scripting", "cross site scripting", "scripting"],
+    "ssrf": ["server side request forgery", "server-side request forgery"],
+    "csrf": ["cross site request forgery", "cross-site request forgery"],
+    "sqli": ["sql injection"],
+    "idor": ["insecure direct object reference", "broken access control"],
+    "rce": ["remote code execution", "command injection"],
+    "lfi": ["local file inclusion", "path traversal"],
+    "rfi": ["remote file inclusion"],
+    "ssti": ["server side template injection", "server-side template injection"],
+    "jwt": ["json web token"],
+    "cors": ["cross origin resource sharing", "cross-origin resource sharing"],
+    "openredirect": ["open redirect", "url redirection"],
+    "xxe": ["xml external entity"],
+    "nosql": ["nosql injection"],
+    "sensitive": ["information disclosure", "data exposure"],
+}
+
+
+def _expand_fts_query(query: str) -> str:
+    """Expand a search query with synonyms, OR-ing each term's synonyms so
+    that 'xss' matches 'cross-site scripting'. Returns the original query if it
+    contains no known tokens."""
+    tokens = re.findall(r"[A-Za-z0-9_]+", query.lower())
+    if not tokens:
+        return query
+    clauses: list[str] = []
+    expanded_any = False
+    for tok in tokens:
+        clauses.append(f'"{tok}"')
+        for syn in _FTS_SYNONYMS.get(tok, []):
+            clauses.append(f'"{syn}"')
+            expanded_any = True
+    # If nothing matched a synonym, keep the original (preserves phrase search).
+    if not expanded_any and len(tokens) == 1:
+        return query
+    return " OR ".join(clauses)
 
 
 log = logging.getLogger("pipeline_state")
@@ -434,7 +478,10 @@ class PipelineState:
 
     def search_findings(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
         """Full-text search across finding title/detail/host/vuln_class_key.
-        Uses FTS5 MATCH when available, otherwise falls back to a LIKE scan."""
+        Uses FTS5 MATCH when available, otherwise falls back to a LIKE scan.
+        C29: query terms are expanded with synonyms (e.g. 'xss' also matches
+        'cross-site scripting')."""
+        match_query = _expand_fts_query(query)
         if self._fts_available:
             try:
                 with self._lock:
@@ -442,7 +489,7 @@ class PipelineState:
                         """SELECT fh.* FROM findings_fts f
                            JOIN findings_history fh ON fh.id = f.finding_id
                            WHERE findings_fts MATCH ? ORDER BY rank LIMIT ?""",
-                        (query, int(limit)))
+                        (match_query, int(limit)))
                     return [dict(r) for r in cur.fetchall()]
             except sqlite3.OperationalError:
                 pass  # malformed MATCH query → fall through to LIKE

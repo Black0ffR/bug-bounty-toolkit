@@ -295,10 +295,53 @@ def run_one_cycle(target: str, scope_path: Path, auth_profiles_path: Path | None
         state.close()
 
 
+def parse_until(spec: str) -> datetime.datetime:
+    """Parse a --until value into an aware datetime.
+
+    Accepts either an ISO-8601 timestamp or a ``HH:MM`` wall-clock time (assumed
+    today; rolls to tomorrow if already passed)."""
+    tz = datetime.timezone.utc
+    spec = spec.strip()
+    # ISO timestamp?
+    try:
+        dt = datetime.datetime.fromisoformat(spec)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt
+    except ValueError:
+        pass
+    # HH:MM wall-clock
+    hhmm = datetime.datetime.strptime(spec, "%H:%M").time()
+    now = datetime.datetime.now(tz)
+    candidate = now.replace(hour=hhmm.hour, minute=hhmm.minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += datetime.timedelta(days=1)
+    return candidate
+
+
+def _past_stop(cycle: int, max_runs: int | None, until_dt: datetime.datetime | None) -> bool:
+    """True when the daemon should stop before running cycle ``cycle``
+    (cycle is 1-based; max_runs is inclusive)."""
+    if max_runs is not None and cycle > max_runs:
+        return True
+    if until_dt is not None and datetime.datetime.now(datetime.timezone.utc) >= until_dt:
+        return True
+    return False
+
+
 def run_watch(scope_path: Path, auth_profiles_path: Path | None,
-              interval: int, output_dir: Path, db_path: Path, *,
-              full_mode: bool = False, once: bool = False) -> int:
-    """Main watch loop."""
+               interval: int, output_dir: Path, db_path: Path, *,
+               full_mode: bool = False, once: bool = False,
+               cooldown: int = 30, max_runs: int | None = None,
+               until: str | None = None) -> int:
+    """Main watch loop.
+
+    B17: ``cooldown`` spaces out consecutive target polls within a round so the
+    daemon never hammers targets back-to-back. B18: ``max_runs`` stops after N
+    completed rounds; ``until`` stops at a wall-clock / ISO time.
+    """
+    until_dt = parse_until(until) if until else None
+
     state = PipelineState(db_path)
     try:
         _ensure_watch_targets_table(state)
@@ -310,7 +353,8 @@ def run_watch(scope_path: Path, auth_profiles_path: Path | None,
         log.error("no in_scope targets found in %s", scope_path)
         return 2
     log.info("watching %d targets: %s", len(targets), ", ".join(targets))
-    log.info("interval: %ds", interval)
+    log.info("interval: %ds  cooldown: %ds  max_runs: %s  until: %s",
+             interval, cooldown, max_runs, until)
     log.info("mode: %s", "deep" if full_mode else "quick")
     if once:
         log.info("--once: running a single cycle and exiting")
@@ -327,8 +371,12 @@ def run_watch(scope_path: Path, auth_profiles_path: Path | None,
         cycle = 0
         while not interrupted:
             cycle += 1
+            if _past_stop(cycle, max_runs, until_dt):
+                log.info("stop condition reached (cycle=%d, max_runs=%s, until=%s) — exiting",
+                         cycle, max_runs, until)
+                break
             log.info("watch cycle #%d starting", cycle)
-            for target in targets:
+            for i, target in enumerate(targets):
                 if interrupted:
                     break
                 try:
@@ -338,8 +386,19 @@ def run_watch(scope_path: Path, auth_profiles_path: Path | None,
                         log.error("cycle failed for %s: %s", target, summary.get("error"))
                 except Exception as exc:
                     log.exception("watch cycle for %s raised: %s", target, exc)
+                # B17: cooldown between consecutive target polls (not after last)
+                if cooldown and i < len(targets) - 1 and not once and not interrupted:
+                    log.info("cooldown %ds before next target poll (Ctrl+C to stop)", cooldown)
+                    for _ in range(cooldown):
+                        if interrupted:
+                            break
+                        time.sleep(1)
             if once:
                 log.info("--once: exiting after single cycle")
+                break
+            # Don't sleep the full interval if a stop condition is now met
+            if _past_stop(cycle + 1, max_runs, until_dt):
+                log.info("stop condition reached — exiting without sleeping")
                 break
             log.info("next cycle in %ds (Ctrl+C to stop)", interval)
             # Sleep in 1s increments so Ctrl+C is responsive
@@ -384,6 +443,12 @@ def main() -> int:
     ap.add_argument("--db", default="pipeline_state.db", help="pipeline_state.db path")
     ap.add_argument("--full-mode", action="store_true", help="run --deep instead of --quick per cycle")
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit (no loop)")
+    ap.add_argument("--cooldown", type=int, default=30,
+                    help="B17: seconds to wait between consecutive target polls (default: 30)")
+    ap.add_argument("--max-runs", type=int, default=None,
+                    help="B18: stop the watch after this many completed cycles")
+    ap.add_argument("--until", default=None,
+                    help="B18: stop at this time — 'HH:MM' wall-clock or ISO-8601 timestamp")
     ap.add_argument("--stop", metavar="TARGET", help="stop watching the given target")
     ap.add_argument("--list", action="store_true", help="list active watch targets")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -423,7 +488,8 @@ def main() -> int:
 
     return run_watch(Path(args.scope), Path(args.auth_profiles) if args.auth_profiles else None,
                      args.interval, Path(args.output_dir), Path(args.db),
-                     full_mode=args.full_mode, once=args.once)
+                     full_mode=args.full_mode, once=args.once,
+                     cooldown=args.cooldown, max_runs=args.max_runs, until=args.until)
 
 
 if __name__ == "__main__":

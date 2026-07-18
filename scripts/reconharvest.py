@@ -345,6 +345,18 @@ class ReconReport:
 
 UA = "Mozilla/5.0 (compatible; ReconHarvest/2.0)"
 
+# Module-level User-Agent override (C18) — set via --user-agent.
+_USER_AGENT = UA
+
+
+def set_user_agent(value: str) -> None:
+    global _USER_AGENT
+    _USER_AGENT = value or UA
+
+
+def user_agent() -> str:
+    return _USER_AGENT
+
 async def tcp_check(ip: str, port: int, timeout: float = 2.0) -> bool:
     """Fast TCP connect check. Returns True if port is open."""
     try:
@@ -371,7 +383,7 @@ async def http_get(
     """GET → (status, headers, body[:3000], redirect_location). Never raises."""
     if not HAS_HTTPX:
         return None, {}, "", None
-    hdrs = {"User-Agent": UA, **(headers or {})}
+    hdrs = {"User-Agent": user_agent(), **(headers or {})}
     try:
         if client:
             resp = await client.get(url, headers=hdrs)
@@ -393,7 +405,7 @@ async def http_post(
     client: "httpx.AsyncClient | None" = None,
 ) -> tuple[int | None, dict, str, str | None]:
     hdrs = {
-        "User-Agent": UA,
+        "User-Agent": user_agent(),
         "Content-Type": "application/json" if json_body else "application/x-www-form-urlencoded",
     }
     try:
@@ -659,7 +671,7 @@ class HostProber:
 
         async with httpx.AsyncClient(
             timeout=self.timeout, verify=False, follow_redirects=False,
-            headers={"User-Agent": UA},
+            headers={"User-Agent": user_agent()},
         ) as client:
             for path in paths[:2]:
                 s, h, b, loc = await http_get(f"{base_url}{path}", client=client)
@@ -1367,6 +1379,8 @@ Examples:
     p.add_argument("--concurrency", type=int, default=30, help="Max concurrent host probes (default: 30)")
     p.add_argument("--no-creds", action="store_true",     help="Skip default credential testing")
     p.add_argument("-v","--verbose", action="store_true", help="Verbose logging")
+    p.add_argument("--user-agent", metavar="UA",
+                   help="Override the User-Agent header sent on every request (C18)")
     return p.parse_args()
 
 
@@ -1374,6 +1388,8 @@ async def main() -> None:
     args = parse_args()
     if args.verbose:
         log.setLevel(logging.DEBUG)
+    if args.user_agent:
+        set_user_agent(args.user_agent)
     print("""
 ╔══════════════════════════════════════════════════════════════════╗
 ║       ReconHarvest v2 — Post-SubTakeover Recon Automation        ║

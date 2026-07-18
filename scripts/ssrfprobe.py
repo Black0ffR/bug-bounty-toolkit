@@ -260,6 +260,18 @@ SEV_COLOR = {
 SEV_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}
 UA = "Mozilla/5.0 (compatible; SSRFProbe/1.0)"
 
+# Module-level User-Agent override (C18) — set via --user-agent.
+_USER_AGENT = UA
+
+
+def set_user_agent(value: str) -> None:
+    global _USER_AGENT
+    _USER_AGENT = value or UA
+
+
+def user_agent() -> str:
+    return _USER_AGENT
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
@@ -352,7 +364,7 @@ async def probe(
     """
     if not HAS_HTTPX:
         return None, {}, "", 0.0
-    hdrs = {"User-Agent": UA, **(headers or {})}
+    hdrs = {"User-Agent": user_agent(), **(headers or {})}
     t0 = time.perf_counter()
     try:
         async with httpx.AsyncClient(
@@ -1261,9 +1273,11 @@ Output      : JSON + HTML with curl PoC per finding
                    help="Emit DNS-resolution-only OOB probes (monitor DNS callbacks, "
                         "not HTTP) — useful when targets egress DNS but not HTTP")
     p.add_argument("--no-metadata",  action="store_true",
-                   help="Skip cloud metadata payloads")
+                    help="Skip cloud metadata payloads")
     p.add_argument("--no-internal",  action="store_true",
-                   help="Skip internal network probes")
+                    help="Skip internal network probes")
+    p.add_argument("--user-agent",  metavar="UA",
+                   help="Override the User-Agent header sent on every request (C18)")
     p.add_argument("--no-obfuscation", action="store_true",
                    help="Skip IP obfuscation bypass payloads")
     p.add_argument("--no-schemes",   action="store_true",
@@ -1280,6 +1294,8 @@ async def main() -> None:
     args = parse_args()
     if args.verbose:
         log.setLevel(logging.DEBUG)
+    if args.user_agent:
+        set_user_agent(args.user_agent)
 
     print("""
 ╔══════════════════════════════════════════════════════════════════╗

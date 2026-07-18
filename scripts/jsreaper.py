@@ -308,6 +308,18 @@ SEV_EMOJI = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","INFO"
 
 UA = "Mozilla/5.0 (compatible; JSReaper/1.0)"
 
+# Module-level User-Agent override (C18) — set via --user-agent.
+_USER_AGENT = UA
+
+
+def set_user_agent(value: str) -> None:
+    global _USER_AGENT
+    _USER_AGENT = value or UA
+
+
+def user_agent() -> str:
+    return _USER_AGENT
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
@@ -402,7 +414,7 @@ async def fetch(
     """
     if not HAS_HTTPX:
         return None, "", {}
-    hdrs = {"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}
+    hdrs = {"User-Agent": user_agent(), "Accept-Encoding": "gzip, deflate"}
     if cookie:
         hdrs["Cookie"] = cookie
     if extra_headers:
@@ -851,7 +863,7 @@ class HostProcessor:
         port   = 443
         async with httpx.AsyncClient(
             timeout=self.timeout, verify=False,
-            follow_redirects=True, headers={"User-Agent": UA},
+            follow_redirects=True, headers={"User-Agent": user_agent()},
         ) as client:
             status, _, _ = await fetch(f"https://{host}/", client=client, max_size_kb=10,
                                        cookie=self.cookie, extra_headers=self.extra_headers)
@@ -1363,6 +1375,8 @@ Feeds into  : apifuzz.py --js, paramfuzz.py --js, ssrfprobe.py --endpoints
     p.add_argument("--auth-profiles", metavar="FILE",
                    help="auth_profiles.yaml — when set, supersedes --cookie (uses named profile 'user_a')")
     p.add_argument("-v","--verbose",  action="store_true", help="Verbose logging")
+    p.add_argument("--user-agent",   metavar="UA",
+                   help="Override the User-Agent header sent on every request (C18)")
     return p.parse_args()
 
 
@@ -1370,6 +1384,8 @@ async def main() -> None:
     args = parse_args()
     if args.verbose:
         log.setLevel(logging.DEBUG)
+    if args.user_agent:
+        set_user_agent(args.user_agent)
 
     print("""
 ╔══════════════════════════════════════════════════════════════════╗

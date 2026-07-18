@@ -50,3 +50,23 @@ def test_fetch_without_auth_sends_only_ua(mock_http_server):
     headers = recs[0]["headers"]
     assert "Cookie" not in headers
     assert "X-Custom" not in headers
+
+
+def test_user_agent_override_applied(mock_http_server):
+    """--user-agent (C18) must override the UA sent on every request."""
+    jsreaper.set_user_agent("CustomUA/9.9")
+    try:
+        base_url, server = mock_http_server
+        server.routes = {("GET", "/ua.js"): {"status": 200, "body": "x"}}
+
+        async def _run():
+            async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+                await jsreaper.fetch(f"{base_url}/ua.js", client=client)
+
+        asyncio.run(_run())
+        recs = [r for r in server.recorded_requests if r["path"].endswith("/ua.js")]
+        assert recs, "request was not recorded"
+        sent_ua = recs[0]["headers"].get("user-agent") or recs[0]["headers"].get("User-Agent")
+        assert sent_ua == "CustomUA/9.9"
+    finally:
+        jsreaper.set_user_agent("")  # reset to module default

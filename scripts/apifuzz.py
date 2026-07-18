@@ -90,6 +90,19 @@ for _n in ("httpx", "httpcore"):
 
 UA = "Mozilla/5.0 (compatible; APIFuzz/1.0)"
 
+# Module-level User-Agent override (C18) — set via --user-agent so all
+# requests from this script use the operator-supplied UA.
+_USER_AGENT = UA
+
+
+def set_user_agent(value: str) -> None:
+    global _USER_AGENT
+    _USER_AGENT = value or UA
+
+
+def user_agent() -> str:
+    return _USER_AGENT
+
 # Common API base paths to brute-force when no spec is available
 API_BASE_PATHS = [
     "/api", "/api/v1", "/api/v2", "/api/v3",
@@ -284,7 +297,7 @@ async def api_request(
     if not HAS_HTTPX:
         return None, {}, "", 0
     hdrs = {
-        "User-Agent": UA,
+        "User-Agent": user_agent(),
         "Accept": "application/json, text/html, */*;q=0.8",
         **(headers or {}),
     }
@@ -1794,7 +1807,9 @@ Output      : JSON + HTML report with curl PoC per finding
     p.add_argument("--timeout",     type=float, default=10.0,
                    help="HTTP timeout per request (default: 10s)")
     p.add_argument("--concurrency", type=int,   default=15,
-                   help="Concurrent host workers (default: 15)")
+                    help="Concurrent host workers (default: 15)")
+    p.add_argument("--user-agent",  metavar="UA",
+                   help="Override the User-Agent header sent on every request (C18)")
     p.add_argument("-v","--verbose",action="store_true", help="Verbose logging")
     return p.parse_args()
 
@@ -1803,6 +1818,9 @@ async def main() -> None:
     args = parse_args()
     if args.verbose:
         log.setLevel(logging.DEBUG)
+    if args.user_agent:
+        set_user_agent(args.user_agent)
+        log.info(f"[Config] User-Agent overridden: {args.user_agent[:40]}...")
 
     print("""
 ╔══════════════════════════════════════════════════════════════════╗

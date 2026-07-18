@@ -182,7 +182,8 @@ class PipelineState:
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self.path = Path(db_path)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._fts_available = False
         self._conn = sqlite3.connect(str(self.path), timeout=10, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -191,6 +192,7 @@ class PipelineState:
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
             self._conn.executescript(SCHEMA_META_SQL)
+            self._init_fts()
             self._conn.commit()
             self._migrate()
 
@@ -213,6 +215,21 @@ class PipelineState:
         )
         self._conn.commit()
 
+    def _init_fts(self) -> None:
+        """Create the FTS5 virtual table for full-text search over findings.
+        Falls back gracefully (search_findings uses LIKE) if the sqlite build
+        lacks the fts5 module."""
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS findings_fts USING fts5("
+                "finding_id UNINDEXED, title, detail, host, vuln_class_key)"
+            )
+            self._fts_available = True
+        except sqlite3.OperationalError:
+            self._fts_available = False
+            log.warning("pipeline_state: FTS5 unavailable; search_findings() "
+                        "falls back to LIKE")
+
     def _migrate(self) -> None:
         """Apply any pending migrations forward to SCHEMA_VERSION."""
         current = self._get_schema_version()
@@ -229,6 +246,42 @@ class PipelineState:
             current = next_ver
         if self._get_schema_version() != SCHEMA_VERSION:
             self._set_schema_version(SCHEMA_VERSION)
+        # Backfill the FTS index for any pre-existing findings not yet indexed.
+        if self._fts_available:
+            try:
+                fts_cnt = self._conn.execute(
+                    "SELECT COUNT(*) FROM findings_fts").fetchone()[0]
+                fh_cnt = self._conn.execute(
+                    "SELECT COUNT(*) FROM findings_history").fetchone()[0]
+                if fts_cnt == 0 and fh_cnt > 0:
+                    self.rebuild_fts()
+            except sqlite3.Error:
+                pass
+
+    def _backup(self, backup_dir: str | Path | None = None,
+                *, keep: int = 5) -> str:
+        """Hot-backup the live DB using sqlite3's online backup API, into a
+        timestamped file. Keeps at most `keep` (default 5) recent backups,
+        pruning the oldest by mtime. Returns the backup file path."""
+        backup_dir = Path(backup_dir or (self.path.parent / "pipeline_state_backups"))
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = backup_dir / f"pipeline_state_{ts}.db"
+        dest_conn = sqlite3.connect(str(dest))
+        try:
+            with self._lock:
+                self._conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+        existing = sorted(backup_dir.glob("pipeline_state_*.db"),
+                          key=lambda p: p.stat().st_mtime)
+        while len(existing) > keep:
+            old = existing.pop(0)
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(dest)
 
     def close(self) -> None:
         with self._lock:
@@ -278,19 +331,20 @@ class PipelineState:
                         finding.get("confidence", ""),
                         finding.get("disposition", ""),
                         finding.get("verified_by"),
-                        json.dumps(finding, default=str) if finding else None,
+                    json.dumps(finding, default=str) if finding else None,
                         now,
                         fid,
                     ),
                 )
                 self._conn.commit()
+                self._sync_fts(fid, finding)
                 return False
             self._conn.execute(
                 """INSERT INTO findings_history
-                   (id, source_tool, host, url, vuln_class_key, severity, title,
-                    confidence, disposition, verified_by, first_seen, last_seen,
-                    payload_json, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (id, source_tool, host, url, vuln_class_key, severity, title,
+                     confidence, disposition, verified_by, first_seen, last_seen,
+                     payload_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     fid,
                     finding.get("source_tool", ""),
@@ -309,6 +363,7 @@ class PipelineState:
                 ),
             )
             self._conn.commit()
+            self._sync_fts(fid, finding)
             return True
 
     def mark_disposition(self, finding_id: str, disposition: str,
@@ -333,6 +388,72 @@ class PipelineState:
                 (finding_id, disposition, now, decided_by, note),
             )
             self._conn.commit()
+
+    def _sync_fts(self, finding_id: str, finding: dict[str, Any]) -> None:
+        """Insert/replace the FTS row for a finding. No-op when FTS5 absent."""
+        if not self._fts_available:
+            return
+        detail = finding.get("detail") or finding.get("evidence") or ""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM findings_fts WHERE finding_id = ?", (finding_id,))
+            self._conn.execute(
+                """INSERT INTO findings_fts(finding_id, title, detail, host, vuln_class_key)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (finding_id, finding.get("title", ""),
+                 detail, finding.get("host", ""), finding.get("vuln_class_key", "")),
+            )
+            self._conn.commit()
+
+    def rebuild_fts(self) -> int:
+        """Re-index every finding into findings_fts. Returns the number indexed."""
+        if not self._fts_available:
+            return 0
+        with self._lock:
+            self._conn.execute("DELETE FROM findings_fts")
+            cur = self._conn.execute(
+                "SELECT id, title, host, vuln_class_key, payload_json "
+                "FROM findings_history")
+            n = 0
+            for row in cur.fetchall():
+                detail = ""
+                if row["payload_json"]:
+                    try:
+                        detail = json.loads(row["payload_json"]).get("detail") \
+                            or json.loads(row["payload_json"]).get("evidence") or ""
+                    except Exception:
+                        detail = ""
+                self._conn.execute(
+                    """INSERT INTO findings_fts(finding_id, title, detail, host, vuln_class_key)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (row["id"], row["title"], detail or "",
+                     row["host"], row["vuln_class_key"]))
+                n += 1
+            self._conn.commit()
+        return n
+
+    def search_findings(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Full-text search across finding title/detail/host/vuln_class_key.
+        Uses FTS5 MATCH when available, otherwise falls back to a LIKE scan."""
+        if self._fts_available:
+            try:
+                with self._lock:
+                    cur = self._conn.execute(
+                        """SELECT fh.* FROM findings_fts f
+                           JOIN findings_history fh ON fh.id = f.finding_id
+                           WHERE findings_fts MATCH ? ORDER BY rank LIMIT ?""",
+                        (query, int(limit)))
+                    return [dict(r) for r in cur.fetchall()]
+            except sqlite3.OperationalError:
+                pass  # malformed MATCH query → fall through to LIKE
+        like = f"%{query}%"
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT * FROM findings_history
+                   WHERE title LIKE ? OR detail LIKE ? OR host LIKE ?
+                         OR vuln_class_key LIKE ? LIMIT ?""",
+                (like, like, like, like, int(limit)))
+            return [dict(r) for r in cur.fetchall()]
 
     def get_finding(self, finding_id: str) -> dict[str, Any] | None:
         with self._lock:

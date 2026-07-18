@@ -71,6 +71,28 @@ def test_parse_curl_command_empty_returns_get():
     assert parsed["url"] == ""
 
 
+def test_parse_curl_command_put_with_body():
+    """C5: PUT with a JSON body must parse method, url, and the body object."""
+    curl = ('curl -sk -D - \\\n  -X PUT \\\n  -H "Authorization: Bearer xyz" \\\n  '
+            "-H \"Content-Type: application/json\" \\\n  "
+            "--data-raw '{\"role\":\"admin\"}' \\\n  "
+            "\"https://api.example.com/v1/users/8841/role\"")
+    parsed = parse_curl_command(curl)
+    assert parsed["method"] == "PUT"
+    assert parsed["url"] == "https://api.example.com/v1/users/8841/role"
+    assert parsed["headers"]["Authorization"] == "Bearer xyz"
+    assert parsed["body"] == {"role": "admin"}
+
+
+def test_parse_curl_command_patch_with_plain_body():
+    """C5: PATCH with a non-JSON body keeps the raw string."""
+    curl = ('curl -sk -X PATCH --data-raw \'role=admin\' '
+            "https://api.example.com/v1/users/8841/role")
+    parsed = parse_curl_command(curl)
+    assert parsed["method"] == "PATCH"
+    assert parsed["body"] == "role=admin"
+
+
 def test_gen_neighbor_ids_integer():
     out = gen_neighbor_ids("100")
     assert "98" in out

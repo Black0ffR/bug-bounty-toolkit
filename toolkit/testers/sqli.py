@@ -204,8 +204,10 @@ def to_normalized_findings(findings: list[SqliFinding],
                 confidence="confirmed" if f.technique == "error" else "probable",
             )
             d = nf.to_dict()
+            d["param"] = f.param
         else:
             d = {"source_tool": source_tool, "host": _host(f.url), "url": f.url,
+                 "param": f.param,
                  "vuln_class_key": "SQL_INJECTION", "severity": severity,
                  "title": f"SQL Injection ({f.technique}) in {f.param}",
                  "detail": detail, "evidence": f.payload,

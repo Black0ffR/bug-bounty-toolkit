@@ -24,10 +24,15 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Make the repo root importable when run as a standalone script.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from toolkit.infra import spider, scope_guard, logfmt

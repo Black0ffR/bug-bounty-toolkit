@@ -283,6 +283,18 @@ class ScopeGuard:
         self._compiled_in = [self._compile(x) for x in self.in_scope]
         self._compiled_out = [self._compile(x) for x in self.out_of_scope]
         self._blocked_log = self.path.parent / "blocked.log"
+        # CIDR exclusion set (§2.5): explicit excluded_cidrs plus any
+        # out_of_scope CIDR entries. Used for DNS-resolved IP exclusion.
+        self.excluded_cidrs: list[str] = [str(x) for x in data.get("excluded_cidrs", [])]
+        self._excluded_nets: list[Any] = [
+            ipaddress.ip_network(c, strict=False) for c in self.excluded_cidrs
+        ]
+        for _regex, net in self._compiled_out:
+            if net is not None:
+                self._excluded_nets.append(net)
+        # 5-minute DNS-resolution cache (host -> (monotonic_time, [ips]))
+        self._dns_cache: dict[str, tuple[float, list[str]]] = {}
+        self._dns_cache_ttl: float = 300.0
         if not self.automation_allowed:
             log.warning("scope.yaml sets automation_allowed=false — tools will refuse to fire")
         log.info(
@@ -374,6 +386,59 @@ class ScopeGuard:
         if not matched:
             self._block(host, source_tool, "no in_scope entry matched")
             raise ScopeError(f"{host} is not in any in_scope entry")
+
+        # §2.5 — DNS-resolved CIDR exclusion. Only does network work when there
+        # are excluded CIDRs configured (explicit or via out_of_scope CIDRs),
+        # so existing scopes without exclusions are unaffected and offline.
+        self.check_excluded(host, source_tool=source_tool)
+
+    def resolve_dns(self, host: str, *, cache_ttl: float | None = None) -> list[str]:
+        """Resolve a host to its IP addresses, caching results for
+        `cache_ttl` seconds (default 300 = 5 min). The resolver is
+        `socket.getaddrinfo`; tests may pre-seed `_dns_cache` or monkeypatch
+        `socket.getaddrinfo` to stay offline."""
+        import socket
+
+        cache_ttl = self._dns_cache_ttl if cache_ttl is None else float(cache_ttl)
+        key = host.strip("[]").split(":")[0] if not host.startswith("[") else host[1:-1]
+        now = time.monotonic()
+        cached = self._dns_cache.get(key)
+        if cached and (now - cached[0]) < cache_ttl:
+            return list(cached[1])
+        try:
+            infos = socket.getaddrinfo(key, None)
+            ips: list[str] = sorted({info[4][0] for info in infos})
+        except (socket.gaierror, OSError):
+            ips = []
+        self._dns_cache[key] = (now, ips)
+        return ips
+
+    def _ip_in_excluded(self, ip: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._excluded_nets)
+
+    def check_excluded(self, host: str, *, source_tool: str = "") -> None:
+        """Reject if the host (as IP literal) or any of its resolved IPs falls
+        inside an excluded CIDR. No-op when no exclusions are configured."""
+        if not self._excluded_nets:
+            return
+        # IP-literal target (no DNS needed)
+        try:
+            if self._ip_in_excluded(host):
+                self._block(host, source_tool, "resolved IP in excluded CIDR")
+                raise ScopeError(f"{host} resolves into an excluded CIDR")
+        except ValueError:
+            pass
+        # Resolved IPs
+        for ip in self.resolve_dns(host):
+            if self._ip_in_excluded(ip):
+                self._block(host, source_tool,
+                            f"resolved IP {ip} in excluded CIDR")
+                raise ScopeError(
+                    f"{host} resolves to {ip}, which is in an excluded CIDR")
 
     def check_url(self, url: str, *, source_tool: str = "") -> None:
         """Extract host from URL and check. Convenience wrapper."""

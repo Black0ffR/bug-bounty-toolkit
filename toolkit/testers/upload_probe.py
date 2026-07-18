@@ -190,6 +190,19 @@ def _build_test_files(token: str) -> list[TestFile]:
             detail="Server accepted a .htaccess upload. Attacker can override Apache config "
                    "in the upload directory, e.g., enable PHP execution for arbitrary extensions.",
         ),
+        # 9. Magic-byte mismatch — valid extension + Content-Type, invalid magic bytes.
+        # Confirms whether the server validates *content* (magic bytes) or only
+        # the declared extension/Content-Type.
+        TestFile(
+            name=f"fake_{token}.png",
+            content_type="image/png",
+            body=b"<?php echo '" + token.encode() + b"'; ?>\n# not a real png",
+            expect_blocked=True, vuln_class="UPLOAD_NO_MAGIC_VALIDATION",
+            severity="LOW",
+            detail="Server accepted a .png with image/png Content-Type whose body is not a "
+                   "valid PNG (no magic bytes). It validates extension/Content-Type but not "
+                   "magic bytes, enabling content-type sniffing / polyglot bypasses.",
+        ),
     ]
 
 
@@ -205,6 +218,77 @@ class UploadResult:
     response_status: int
     response_snippet: str
     token: str
+    served_status: int = 0
+    served_content_type: str = ""
+    served_executable: bool = False
+
+
+# Content-Types that indicate a file is served and executed/handled as code.
+_EXECUTABLE_CONTENT_TYPES = {
+    "text/html", "application/x-httpd-php", "application/x-httpd-php5",
+    "application/x-httpd-php7", "application/x-httpd-php8", "application/javascript",
+    "application/x-javascript", "text/javascript",
+}
+# File extensions that are executable when served by a web server.
+_RISKY_EXTENSIONS = (
+    ".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".phps", ".pht",
+    ".jsp", ".jspx", ".asp", ".aspx", ".shtml", ".shtm", ".cgi", ".pl",
+    ".py", ".rb", ".htaccess",
+)
+
+
+def _is_executable_content_type(ct: str | None) -> bool:
+    if not ct:
+        return False
+    return ct.split(";")[0].strip().lower() in _EXECUTABLE_CONTENT_TYPES
+
+
+def _script_like_file(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    return base.endswith(_RISKY_EXTENSIONS)
+
+
+def _candidate_serve_urls(result: UploadResult, endpoint: str) -> list[str]:
+    """Derive candidate URLs the uploaded file might be served from.
+
+    Sources: (1) any absolute URL echoed in the response body, (2) a heuristic
+    PUT-style path of endpoint/<filename>."""
+    urls: list[str] = []
+    for m in re.finditer(r'https?://[^\s"\'<>]+', result.response_snippet):
+        urls.append(m.group(0).rstrip('.,);'))
+    fname = result.test_file.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if fname:
+        base = endpoint.rstrip("/")
+        urls.append(base + "/" + fname)
+    return urls
+
+
+async def verify_served(client, endpoint: str, result: UploadResult,
+                        guard: scope_guard.ScopeGuard) -> None:
+    """B13 closed-loop confirmation (SAFE: only issues a GET and inspects the
+    Content-Type — never executes anything). If an accepted script-like file is
+    served back with an executable Content-Type, mark it served_executable."""
+    if result.actually_blocked or not _script_like_file(result.test_file):
+        return
+    for url in _candidate_serve_urls(result, endpoint):
+        try:
+            guard.check_url(url, source_tool="upload_probe.py")
+        except scope_guard.ScopeError:
+            continue
+        if not guard.acquire_token(timeout=20.0):
+            continue
+        try:
+            try:
+                resp = await client.get(url, timeout=15.0, follow_redirects=True)
+            except Exception:
+                continue
+            result.served_status = int(resp.status_code or 0)
+            result.served_content_type = resp.headers.get("content-type", "")
+            if result.served_status == 200 and _is_executable_content_type(result.served_content_type):
+                result.served_executable = True
+            return
+        finally:
+            guard.release_token()
 
 
 async def upload_one(client, endpoint: str, method: str, param_name: str,
@@ -302,6 +386,17 @@ async def scan_endpoint(endpoint: str, method: str, param_name: str,
             results.append(r)
             log.info("  %s → %s (blocked=%s, severity=%s)",
                      tf.name, r.response_status, r.actually_blocked, r.severity)
+        # B13 — closed-loop confirmation: for any accepted script-like upload,
+        # verify whether it is served back and executed. SAFE: GET-only.
+        verify_client = httpx.AsyncClient(timeout=15.0, verify=False, follow_redirects=True)
+        try:
+            for r in results:
+                await verify_served(verify_client, endpoint, r, guard)
+                if r.served_executable:
+                    log.info("  %s SERVED EXECUTABLE (%s, %s)",
+                             r.test_file, r.served_status, r.served_content_type)
+        finally:
+            await verify_client.aclose()
     return results
 
 
@@ -337,11 +432,53 @@ def to_normalized(results: list[UploadResult]) -> list[dict[str, Any]]:
                 "response_status": r.response_status,
                 "response_snippet": r.response_snippet[:300],
                 "token": r.token,
+                "served_status": r.served_status,
+                "served_content_type": r.served_content_type,
+                "served_executable": r.served_executable,
             },
             "confidence": "candidate",
             "disposition": "new",
             "verified_by": None,
             "typical_payout": "$500-$5000" if r.severity in ("HIGH", "CRITICAL") else "$100-$1000",
+        })
+    # B13 — closed-loop confirmation finding: an uploaded script-like file is
+    # served back and executed (executable Content-Type). Escalates to CRITICAL.
+    for r in results:
+        if not r.served_executable:
+            continue
+        host = urlparse(r.endpoint).hostname or ""
+        evidence = (f"{r.endpoint}|{r.test_file}|served="
+                    f"{r.served_status}|ct={r.served_content_type}|{r.token}")
+        fid = compute_finding_id("upload_probe.py", host, "UPLOAD_SERVED_EXECUTABLE", evidence)
+        out.append({
+            "id": fid,
+            "source_tool": "upload_probe.py",
+            "host": host,
+            "url": r.endpoint,
+            "vuln_class_key": "UPLOAD_SERVED_EXECUTABLE",
+            "severity": "CRITICAL",
+            "title": f"Uploaded file served and executed: {r.test_file}",
+            "detail": (f"The uploaded file {r.test_file} was accepted and is served back at an "
+                       f"accessible URL with Content-Type {r.served_content_type!r} "
+                       f"(HTTP {r.served_status}). An attacker can upload a script and achieve "
+                       f"remote code execution."),
+            "evidence": evidence,
+            "remediation": (
+                "Never serve uploaded files from a directory where the web server executes "
+                "code. Store uploads outside the web root or on a separate (non-executing) "
+                "host/domain, and force Content-Disposition: attachment. Validate magic bytes "
+                "and enforce an extension allowlist before persisting."
+            ),
+            "raw": {
+                "test_file": r.test_file,
+                "served_status": r.served_status,
+                "served_content_type": r.served_content_type,
+                "token": r.token,
+            },
+            "confidence": "probable",
+            "disposition": "new",
+            "verified_by": None,
+            "typical_payout": "$1000-$10000",
         })
     return out
 

@@ -287,6 +287,9 @@ from toolkit.testers.upload_probe import (
     _UPLOAD_URL_RE,
     _UPLOAD_PARAM_RE,
     _build_test_files,
+    _is_executable_content_type,
+    _script_like_file,
+    _candidate_serve_urls,
     find_upload_endpoints,
     to_normalized as upload_to_normalized,
     UploadResult,
@@ -308,15 +311,16 @@ def test_upload_param_re_matches():
     assert not _UPLOAD_PARAM_RE.match("username")
 
 
-def test_build_test_files_has_8_categories():
+def test_build_test_files_has_9_categories():
     tfs = _build_test_files("TOKEN")
-    assert len(tfs) == 8
+    assert len(tfs) == 9
     classes = {tf.vuln_class for tf in tfs}
     assert "UPLOAD_EXTENSION_MISMATCH" in classes
     assert "UPLOAD_PATH_TRAVERSAL" in classes
     assert "UPLOAD_POLYGLOT" in classes
     assert "UPLOAD_SVG_XSS" in classes
     assert "UPLOAD_HTACCESS" in classes
+    assert "UPLOAD_NO_MAGIC_VALIDATION" in classes
 
 
 def test_find_upload_endpoints():
@@ -345,6 +349,95 @@ def test_upload_to_normalized_only_emits_when_expected_blocked_but_wasnt():
     out = upload_to_normalized([r1, r2])
     assert len(out) == 1
     assert out[0]["vuln_class_key"] == "UPLOAD_EXTENSION_MISMATCH"
+
+
+# ── B12: magic-byte (content) validation probe ───────────────────────────────
+
+def test_magic_validation_probe_emitted_when_accepted():
+    """B12: server claims image (valid extension + Content-Type) but body has no
+    magic bytes → flag UPLOAD_NO_MAGIC_VALIDATION when accepted."""
+    r = UploadResult(
+        endpoint="https://x", test_file="fake.png", vuln_class="UPLOAD_NO_MAGIC_VALIDATION",
+        expected_blocked=True, actually_blocked=False,
+        severity="LOW", detail="d", response_status=200, response_snippet="ok", token="T",
+    )
+    out = upload_to_normalized([r])
+    assert len(out) == 1
+    assert out[0]["vuln_class_key"] == "UPLOAD_NO_MAGIC_VALIDATION"
+
+
+# ── B13: closed-loop served/executable confirmation ──────────────────────────
+
+def test_executable_content_type_detection():
+    assert _is_executable_content_type("application/x-httpd-php")
+    assert _is_executable_content_type("text/html; charset=utf-8")
+    assert not _is_executable_content_type("image/png")
+    assert not _is_executable_content_type(None)
+
+
+def test_script_like_file():
+    assert _script_like_file("shell.php")
+    assert _script_like_file("a/b/shell.jsp")
+    assert not _script_like_file("photo.png")
+
+
+def test_candidate_serve_urls_from_body():
+    r = UploadResult(
+        endpoint="https://x/upload", test_file="shell.php", vuln_class="UPLOAD_EXTENSION_MISMATCH",
+        expected_blocked=True, actually_blocked=False, severity="HIGH", detail="d",
+        response_status=200, response_snippet='{"url":"https://x/files/shell.php"}', token="T",
+    )
+    urls = _candidate_serve_urls(r, "https://x/upload")
+    assert "https://x/files/shell.php" in urls
+    assert any(u.endswith("/shell.php") for u in urls)
+
+
+def test_served_executable_emits_critical_finding():
+    """B13: an accepted script-like file served back as executable → CRITICAL."""
+    r = UploadResult(
+        endpoint="https://x/upload", test_file="shell.php", vuln_class="UPLOAD_EXTENSION_MISMATCH",
+        expected_blocked=True, actually_blocked=False, severity="HIGH", detail="d",
+        response_status=200, response_snippet="ok", token="T",
+        served_status=200, served_content_type="application/x-httpd-php",
+        served_executable=True,
+    )
+    out = upload_to_normalized([r])
+    classes = {f["vuln_class_key"] for f in out}
+    assert "UPLOAD_SERVED_EXECUTABLE" in classes
+    sev = next(f["severity"] for f in out if f["vuln_class_key"] == "UPLOAD_SERVED_EXECUTABLE")
+    assert sev == "CRITICAL"
+
+
+class _FakeResp:
+    def __init__(self, status, headers):
+        self.status_code = status
+        self.headers = headers
+
+
+class _FakeClient:
+    def __init__(self, status, headers):
+        self._resp = _FakeResp(status, headers)
+        self.calls = []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        return self._resp
+
+
+def test_verify_served_marks_executable(temp_scope_yaml):
+    from toolkit.infra import scope_guard
+    from toolkit.testers.upload_probe import verify_served
+    guard = scope_guard.ScopeGuard(temp_scope_yaml)
+    r = UploadResult(
+        endpoint="http://127.0.0.1:1/upload", test_file="shell.php",
+        vuln_class="UPLOAD_EXTENSION_MISMATCH", expected_blocked=True,
+        actually_blocked=False, severity="HIGH", detail="d", response_status=200,
+        response_snippet="", token="T",
+    )
+    client = _FakeClient(200, {"content-type": "application/x-httpd-php"})
+    asyncio.run(verify_served(client, "http://127.0.0.1:1/upload", r, guard))
+    assert r.served_executable is True
+    assert r.served_status == 200
 
 
 # ── apk_static ──────────────────────────────────────────────────────────────

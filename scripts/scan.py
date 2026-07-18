@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+scan.py — autonomous end-to-end scan entrypoint (P2)
+===================================================
+
+Ties the pipeline together so a single command actually finds vulnerabilities
+on a live target without hand-fed seed lists:
+
+    python scripts/scan.py --url https://target.example.com
+
+Steps:
+  1. Crawl the target (toolkit/infra/spider.py) to discover endpoints + params.
+  2. Run SQL injection tests (toolkit/testers/sqli.py) on every param.
+  3. Run context-aware XSS verification (toolkit/verify/xss_context.py) on
+     query-injected params.
+  4. Aggregate normalized findings and emit JSON + (optional) reports.
+
+Authorized penetration testing / bug bounty research only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+try:
+    from toolkit.infra import spider, scope_guard, logfmt
+    from toolkit.testers import sqli
+    from toolkit.verify import xss_context
+    _HAVE_TOOLKIT = True
+except Exception as exc:  # pragma: no cover
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    logging.error("toolkit import failed: %s", exc)
+    raise
+
+log = logging.getLogger("scan")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="scan.py",
+                                 description="Autonomous crawl + vuln scan")
+    p.add_argument("--url", "-u", required=True, help="Start URL")
+    p.add_argument("--depth", type=int, default=2, help="Crawl depth (default 2)")
+    p.add_argument("--max-urls", type=int, default=200, help="Max URLs to crawl")
+    p.add_argument("--concurrency", type=int, default=10)
+    p.add_argument("--timeout", type=float, default=12.0)
+    p.add_argument("--no-xss", action="store_true", help="Skip XSS verification")
+    p.add_argument("--output", "-o", default="scan-findings.json")
+    p.add_argument("--report", choices=("sarif", "csv", "hackerone", "bugcrowd"),
+                   help="Also render a report in this format")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--log-format", choices=("text", "json"), default="text")
+    return p.parse_args()
+
+
+async def _scan(args: argparse.Namespace) -> dict[str, Any]:
+    limits = httpx.Limits(max_connections=args.concurrency)
+    async with httpx.AsyncClient(timeout=args.timeout, follow_redirects=True,
+                                 limits=limits) as client:
+        log.info("crawling %s (depth=%d)", args.url, args.depth)
+        endpoints = await spider.crawl(
+            args.url, client, max_depth=args.depth, max_urls=args.max_urls,
+            concurrency=args.concurrency, timeout=args.timeout,
+        )
+        log.info("discovered %d endpoints", len(endpoints))
+        params_total = sum(len(e.params) for e in endpoints)
+        log.info("with %d injectable parameters", params_total)
+
+        findings: list[dict[str, Any]] = []
+
+        # SQLi
+        sqli_res = await sqli.run_sqli(endpoints, client,
+                                        timeout=args.timeout,
+                                        concurrency=args.concurrency)
+        log.info("SQLi findings: %d", len(sqli_res))
+        findings.extend(sqli.to_normalized_findings(sqli_res))
+
+        # XSS (query-injected params only)
+        if not args.no_xss:
+            points = [{
+                "url": e.url, "method": e.method, "param_name": prm,
+                "inject_via": e.inject_via,
+            } for e in endpoints for prm in e.params if e.inject_via == "query"]
+            log.info("XSS injection points: %d", len(points))
+            if points:
+                guard = scope_guard.get_default()
+                xss_res = await xss_context.verify_all(points, guard,
+                                                       concurrency=args.concurrency)
+                confirmed = sum(1 for x in xss_res if x.breakout_succeeded)
+                log.info("XSS findings: %d (confirmed breakout: %d)",
+                         len(xss_res), confirmed)
+                findings.extend(xss_context.to_normalized_findings(xss_res))
+
+    return {
+        "target": args.url,
+        "endpoints_discovered": len(endpoints),
+        "total_findings": len(findings),
+        "findings": findings,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    if _HAVE_TOOLKIT:
+        logfmt.configure_logging(fmt=args.log_format,
+                                 level=logging.DEBUG if args.verbose else logging.INFO)
+    elif args.verbose:
+        log.setLevel(logging.DEBUG)
+
+    result = asyncio.run(_scan(args))
+
+    out_path = Path(args.output)
+    out_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    log.info("wrote %s", out_path)
+
+    if args.report:
+        try:
+            from toolkit.infra import reporter
+            rendered = reporter.render(result["findings"], args.report)
+            report_path = out_path.with_suffix(
+                ".sarif" if args.report == "sarif" else ".csv"
+                if args.report == "csv" else ".md")
+            text = json.dumps(rendered, indent=2) if args.report == "sarif" else rendered
+            report_path.write_text(text, encoding="utf-8")
+            log.info("wrote report %s", report_path)
+        except Exception as exc:  # pragma: no cover
+            log.warning("report render failed: %s", exc)
+
+    crit = sum(1 for f in result["findings"] if f.get("severity") == "CRITICAL")
+    high = sum(1 for f in result["findings"] if f.get("severity") == "HIGH")
+    if crit or high:
+        log.warning("[!] %d CRITICAL + %d HIGH findings", crit, high)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

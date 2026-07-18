@@ -173,18 +173,32 @@ def build_triage_entries(findings: list[dict[str, Any]], state: PipelineState,
     return entries
 
 
+def _parse_dt(s: str | None) -> datetime.datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def apply_filters(entries: list[TriageEntry], *,
                   severity: str | None = None,
                   host: str | None = None,
-                  vuln_class_key: str | None = None) -> list[TriageEntry]:
-    """Narrow the active queue by severity / host / vuln class. Case-insensitive
-    substring match on host and class; exact (case-insensitive) match on severity."""
-    if not (severity or host or vuln_class_key):
+                  vuln_class_key: str | None = None,
+                  since: str | None = None,
+                  until: str | None = None) -> list[TriageEntry]:
+    """Narrow the active queue by severity / host / vuln class / date window.
+    Case-insensitive substring match on host and class; exact (case-insensitive)
+    match on severity. `since`/`until` filter on the finding's last_seen (ISO 8601)."""
+    if not (severity or host or vuln_class_key or since or until):
         return entries
     out: list[TriageEntry] = []
     sev = severity.upper() if severity else None
     host_l = host.lower() if host else None
     cls_l = vuln_class_key.lower() if vuln_class_key else None
+    since_dt = _parse_dt(since)
+    until_dt = _parse_dt(until)
     for e in entries:
         f = e.finding
         if sev and f.severity.upper() != sev:
@@ -192,6 +206,11 @@ def apply_filters(entries: list[TriageEntry], *,
         if host_l and host_l not in f.host.lower():
             continue
         if cls_l and cls_l not in f.vuln_class_key.lower():
+            continue
+        seen = _parse_dt(f.last_seen)
+        if since_dt and seen is not None and seen < since_dt:
+            continue
+        if until_dt and seen is not None and seen > until_dt:
             continue
         out.append(e)
     return out
@@ -543,6 +562,8 @@ def main() -> int:
     ap.add_argument("--filter-severity", help="only show findings of this severity (e.g. CRITICAL)")
     ap.add_argument("--filter-host", help="only show findings whose host contains this substring")
     ap.add_argument("--filter-class", help="only show findings whose vuln class contains this substring")
+    ap.add_argument("--filter-since", help="only findings seen on/after this ISO-8601 timestamp")
+    ap.add_argument("--filter-until", help="only findings seen on/before this ISO-8601 timestamp")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -558,7 +579,8 @@ def main() -> int:
     try:
         entries = build_triage_entries(raw_findings, state)
         entries = apply_filters(entries, severity=args.filter_severity,
-                                host=args.filter_host, vuln_class_key=args.filter_class)
+                                host=args.filter_host, vuln_class_key=args.filter_class,
+                                since=args.filter_since, until=args.filter_until)
         log.info("active queue: %d findings (after filtering previously submitted/rejected)", len(entries))
 
         md = render_queue_md(entries, top=args.top)

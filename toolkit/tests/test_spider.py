@@ -87,3 +87,25 @@ def test_crawl_respects_same_origin():
     eps = asyncio.run(spider.crawl("http://t.com/", _FakeClient(pages),
                                    max_depth=1, max_urls=50))
     assert all("other.com" not in e.url for e in eps)
+
+
+def test_crawl_injects_seeds_as_endpoints():
+    # A hidden endpoint never linked from the home page, supplied as a seed.
+    pages = {"http://t.com/": HTML_HOME}
+    eps = asyncio.run(spider.crawl(
+        "http://t.com/", _FakeClient(pages), max_depth=1, max_urls=50,
+        seeds=["http://t.com/hidden?q=1&id=9"],
+    ))
+    hidden = [e for e in eps if e.url == "http://t.com/hidden?q=1&id=9"]
+    assert hidden, "seed endpoint not injected"
+    assert set(hidden[0].params) == {"q", "id"}
+    assert hidden[0].inject_via == "query"
+
+
+def test_crawl_seeds_out_of_scope_ignored():
+    pages = {"http://t.com/": HTML_HOME}
+    eps = asyncio.run(spider.crawl(
+        "http://t.com/", _FakeClient(pages), max_depth=1, max_urls=50,
+        seeds=["http://evil.example.com/x?a=1"],
+    ))
+    assert not any("evil.example.com" in e.url for e in eps)

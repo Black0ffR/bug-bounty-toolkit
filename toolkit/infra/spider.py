@@ -134,10 +134,16 @@ async def crawl(
     same_origin: bool = True,
     timeout: float = 10.0,
     scope_path: str | None = None,
+    seeds: list[str] | None = None,
 ) -> list[Endpoint]:
     """Bounded BFS crawl. ``client`` must expose an awaitable
     ``client.get(url, headers=..., timeout=...) -> resp`` with ``.text`` and
     ``.status_code``.
+
+    ``seeds`` are URLs (e.g. historical Wayback paths, JS-discovered API
+    routes, hidden endpoints) injected directly as endpoints (with their
+    query params) and also enqueued for further crawling. This lets recon
+    output feed the scanner without the live crawler having to link to them.
 
     Returns a deduplicated list of discovered ``Endpoint`` objects (links,
     forms, and asset URLs with their parameters).
@@ -148,6 +154,17 @@ async def crawl(
     visited: set[str] = set()
     collected: dict[tuple[str, str], Endpoint] = {}
     queue: list[str] = [_normalize(start_url)]
+
+    for s in (seeds or []):
+        s_n = _normalize(s)
+        if not _in_scope(s_n, guard, start_netloc, same_origin):
+            continue
+        ep = _endpoint_from_url(s_n)
+        key = (ep.url, ep.method)
+        if key not in collected:
+            collected[key] = ep
+        if s_n not in visited:
+            queue.append(s_n)
 
     sem = asyncio.Semaphore(concurrency)
     headers = {"User-Agent": "Mozilla/5.0 (compatible; BBTK-Spider/1.0)"}

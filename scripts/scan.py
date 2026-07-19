@@ -42,6 +42,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -88,6 +89,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--proxy-list", default=None,
                    help="Comma-separated proxy URLs for rotation")
     p.add_argument("--output", "-o", default="scan-findings.json")
+    p.add_argument("--recon", default=None,
+                   help="Load a recon.json and feed its seeds into the scan")
+    p.add_argument("--chain-recon", action="store_true",
+                   help="Run recon first, then scan the discovered surface")
     p.add_argument("--report", choices=("sarif", "csv", "hackerone", "bugcrowd"),
                    help="Also render a report in this format")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -108,6 +113,22 @@ def _build_policy(args: argparse.Namespace):
                          respect_robots=False, random_agent=False)
 
 
+async def _load_recon_seeds(args: argparse.Namespace, client, target_netloc: str):
+    """Return (same_origin_urls, subdomain_hosts) from --recon / --chain-recon."""
+    from toolkit.recon import run as recon_run
+    if args.chain_recon:
+        log.info("running recon before scan")
+        recon = await recon_run.run_recon(
+            args.url, client, depth=args.depth, timeout=args.timeout)
+    elif args.recon:
+        with open(args.recon, "r", encoding="utf-8") as f:
+            recon = json.load(f)
+    else:
+        return [], []
+    seeds = recon_run.recon_to_seeds(recon, target_netloc)
+    return seeds["same_origin"], seeds["subdomain_hosts"]
+
+
 async def _scan(args: argparse.Namespace) -> dict[str, Any]:
     limits = httpx.Limits(max_connections=args.concurrency)
     from toolkit.infra.stealth import StealthClient
@@ -116,12 +137,48 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
         if args.stealth:
             log.info("STEALTH mode: rate=%.2f rps jitter=%.2f robots=%s ua=%s",
                      args.rate, args.jitter, args.respect_robots, args.random_agent)
+
+        target_netloc = urlparse(args.url).netloc
+        same_origin_seeds, subdomain_hosts = await _load_recon_seeds(
+            args, client, target_netloc)
+
         log.info("crawling %s (depth=%d)", args.url, args.depth)
         endpoints = await spider.crawl(
             args.url, client, max_depth=args.depth, max_urls=args.max_urls,
             concurrency=args.concurrency, timeout=args.timeout,
+            seeds=same_origin_seeds,
         )
-        log.info("discovered %d endpoints", len(endpoints))
+        # Each live subdomain host gets its own bounded crawl.
+        for host in subdomain_hosts:
+            for scheme in ("https", "http"):
+                try:
+                    sub_url = f"{scheme}://{host}"
+                    sub_eps = await spider.crawl(
+                        sub_url, client, max_depth=1, max_urls=args.max_urls,
+                        concurrency=args.concurrency, timeout=args.timeout,
+                    )
+                    endpoints.extend(sub_eps)
+                    if sub_eps:
+                        break
+                except Exception as exc:  # pragma: no cover
+                    log.debug("subdomain crawl %s failed: %s", host, exc)
+
+        # de-dup merged endpoints by (url, method)
+        merged: dict[tuple[str, str], Any] = {}
+        for ep in endpoints:
+            key = (ep.url, ep.method)
+            if key in merged:
+                existing = merged[key]
+                merged_params = sorted(set(existing.params) | set(ep.params))
+                merged[key] = spider.Endpoint(url=existing.url, method=existing.method,
+                                              params=merged_params,
+                                              inject_via=existing.inject_via,
+                                              source=existing.source)
+            else:
+                merged[key] = ep
+        endpoints = list(merged.values())
+        log.info("discovered %d endpoints (%d from recon seeds)",
+                 len(endpoints), len(same_origin_seeds))
         params_total = sum(len(e.params) for e in endpoints)
         log.info("with %d injectable parameters", params_total)
 

@@ -86,10 +86,15 @@ def recon_to_seeds(recon: dict, target_netloc: str) -> dict:
     same_origin: list[str] = []
     for url in list(recon.get("js_endpoints", [])) + list(recon.get("wayback_urls", [])):
         try:
-            netloc = urlparse(url).netloc
+            p = urlparse(url)
         except Exception:
             continue
-        if netloc and (netloc == target_netloc or netloc.endswith("." + target_netloc)):
+        if p.netloc == target_netloc:
+            same_origin.append(url)
+        elif p.netloc == "" and url.startswith("/"):
+            # relative JS/endpoint path -> resolve against the target
+            same_origin.append(f"http://{target_netloc}{url}")
+        elif p.netloc.endswith("." + target_netloc):
             same_origin.append(url)
     hosts = [h.get("host") for h in recon.get("live_hosts", []) if h.get("live")]
     return {"same_origin": sorted(set(same_origin)), "subdomain_hosts": sorted(set(hosts))}

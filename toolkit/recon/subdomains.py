@@ -6,6 +6,7 @@ de-duplicated and filtered to the target domain suffix.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from urllib.parse import urlparse
 
@@ -36,6 +37,49 @@ async def crtsh_subdomains(domain: str, client, timeout: float = 12.0) -> list[s
             name = name.strip().lower()
             if name and "*" not in name:
                 seen.add(name)
+    return sorted(n for n in seen if n == domain or n.endswith("." + domain))
+
+
+async def alienvault_subdomains(domain: str, client, timeout: float = 12.0) -> list[str]:
+    """Enumerate subdomains via AlienVault OTX passive DNS (no API key)."""
+    url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+    try:
+        r = await client.get(
+            url, timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; BBTK/1.0)"},
+        )
+    except Exception:
+        return []
+    if getattr(r, "status_code", 0) != 200:
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        return []
+    seen: set[str] = set()
+    for row in data.get("passive_dns", []) or []:
+        host = (row.get("hostname") or "").strip().lower()
+        if host and "*" not in host:
+            seen.add(host)
+    return sorted(n for n in seen if n == domain or n.endswith("." + domain))
+
+
+async def enumerate_subdomains(domain: str, client, timeout: float = 12.0) -> list[str]:
+    """Aggregate multiple passive sources into one de-duplicated list.
+
+    New sources can be slotted in here (Chaos, subfinder, assetfinder, ...) as
+    long as they return ``list[str]``; failures degrade to an empty list.
+    """
+    results = await asyncio.gather(
+        crtsh_subdomains(domain, client, timeout=timeout),
+        alienvault_subdomains(domain, client, timeout=timeout),
+        return_exceptions=True,
+    )
+    seen: set[str] = set()
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        seen.update(res or [])
     return sorted(n for n in seen if n == domain or n.endswith("." + domain))
 
 

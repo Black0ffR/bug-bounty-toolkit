@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from toolkit.recon import subdomains, wayback, tech, js, posture, run
+from toolkit.recon import subdomains, wayback, tech, js, posture, run, enrich
 
 
 class FakeResp:
@@ -133,3 +133,65 @@ def test_run_recon_integration():
     assert any(s["type"] == "aws_access_key_id" for s in result["js_secrets"])
     assert result["tech"]["server"].startswith("nginx")
     assert any(f["issue"] == "missing_csp" for f in result["posture"])
+
+
+def test_alienvault_subdomains():
+    data = {"passive_dns": [
+        {"hostname": "api.example.com"},
+        {"hostname": "*.wild.example.com"},
+        {"hostname": "other.com"},
+    ]}
+    client = FakeClient({"otx.alienvault.com": FakeResp(200, json_data=data)})
+    out = asyncio.run(subdomains.alienvault_subdomains("example.com", client))
+    assert out == ["api.example.com"]
+
+
+def test_enumerate_subdomains_aggregates():
+    crt = [{"name_value": "a.example.com"}]
+    otx = {"passive_dns": [{"hostname": "b.example.com"},
+                           {"hostname": "a.example.com"}]}
+    client = FakeClient({
+        "crt.sh": FakeResp(200, json_data=crt),
+        "otx.alienvault.com": FakeResp(200, json_data=otx),
+    })
+    out = asyncio.run(subdomains.enumerate_subdomains("example.com", client))
+    assert out == ["a.example.com", "b.example.com"]
+
+
+def test_live_check_probes_https_then_http():
+    https = FakeResp(200, "ok", headers={"server": "nginx"})
+    http = FakeResp(200, "ok")
+    # first host: https live; second host: https fails, http live
+    def router(url, **kw):
+        if url == "https://up.example.com":
+            return https
+        if url == "https://httponly.example.com":
+            raise Exception("conn refused")
+        if url == "http://httponly.example.com":
+            return http
+        return FakeResp(0, "")
+    class RouterClient:
+        async def get(self, url, **kw):
+            return router(url, **kw)
+    res = asyncio.run(enrich.live_check(
+        ["up.example.com", "httponly.example.com"], RouterClient()))
+    up = next(r for r in res if r["host"] == "up.example.com")
+    assert up["live"] and up["status"] == 200 and up["tech"]["server"].startswith("nginx")
+    ho = next(r for r in res if r["host"] == "httponly.example.com")
+    assert ho["live"] and ho["url"] == "http://httponly.example.com"
+
+
+def test_recon_to_seeds_filters_scope():
+    recon = {
+        "js_endpoints": ["/api/x", "https://evil.com/p"],
+        "wayback_urls": ["https://example.com/old?q=1",
+                         "https://sub.example.com/s", "https://other.com/z"],
+        "live_hosts": [{"host": "sub.example.com", "live": True},
+                       {"host": "dead.example.com", "live": False}],
+    }
+    seeds = run.recon_to_seeds(recon, "example.com")
+    assert "https://example.com/old?q=1" in seeds["same_origin"]
+    assert "https://sub.example.com/s" in seeds["same_origin"]
+    assert "https://evil.com/p" not in seeds["same_origin"]
+    assert "https://other.com/z" not in seeds["same_origin"]
+    assert seeds["subdomain_hosts"] == ["sub.example.com"]

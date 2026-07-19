@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+from . import enrich as enrich_mod
 from . import js as js_mod
 from . import posture as posture_mod
 from . import subdomains as sub_mod
@@ -26,6 +27,7 @@ async def run_recon(target_url: str, client, *, depth: int = 1,
         "js_endpoints": [],
         "js_secrets": [],
         "subdomains": [],
+        "live_hosts": [],
         "wayback_urls": [],
         "js_error": None,
     }
@@ -61,8 +63,33 @@ async def run_recon(target_url: str, client, *, depth: int = 1,
 
     domain = result["domain"]
     if domain:
-        result["subdomains"] = await sub_mod.crtsh_subdomains(domain, client, timeout=timeout)
+        result["subdomains"] = await sub_mod.enumerate_subdomains(
+            domain, client, timeout=timeout)
         result["wayback_urls"] = await wb_mod.wayback_urls(
             domain, client, limit=wayback_limit, timeout=timeout)
+        # Confirm which discovered hosts actually answer, with tech/posture.
+        checks = await enrich_mod.live_check(result["subdomains"], client,
+                                             timeout=timeout)
+        result["live_hosts"] = enrich_mod.live_hosts_only(checks)
 
     return result
+
+
+def recon_to_seeds(recon: dict, target_netloc: str) -> dict:
+    """Convert a recon result into scanner seeds.
+
+    Returns {"same_origin": [urls], "subdomain_hosts": [hosts]}:
+      * ``same_origin`` — js_endpoints + wayback_urls that hit the target
+        host; fed as extra crawl seeds so detectors test historical/JS paths.
+      * ``subdomain_hosts`` — live subdomain hosts; each gets its own crawl.
+    """
+    same_origin: list[str] = []
+    for url in list(recon.get("js_endpoints", [])) + list(recon.get("wayback_urls", [])):
+        try:
+            netloc = urlparse(url).netloc
+        except Exception:
+            continue
+        if netloc and (netloc == target_netloc or netloc.endswith("." + target_netloc)):
+            same_origin.append(url)
+    hosts = [h.get("host") for h in recon.get("live_hosts", []) if h.get("live")]
+    return {"same_origin": sorted(set(same_origin)), "subdomain_hosts": sorted(set(hosts))}

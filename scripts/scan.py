@@ -94,6 +94,9 @@ def parse_args() -> argparse.Namespace:
                    help="Load a recon.json and feed its seeds into the scan")
     p.add_argument("--chain-recon", action="store_true",
                    help="Run recon first, then scan the discovered surface")
+    p.add_argument("--recon-only", action="store_true",
+                   help="Skip the heavy detectors; emit only recon-derived "
+                        "findings (JS secrets, missing headers) for a fast demo")
     p.add_argument("--report", choices=("sarif", "csv", "hackerone", "bugcrowd"),
                    help="Also render a report in this format")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -158,18 +161,67 @@ def _secret_findings(secrets: list[dict], target_url: str) -> list[dict]:
     return out
 
 
+_POSTURE_SEVERITY = {
+    "missing_hsts": "MEDIUM",
+    "missing_csp": "LOW",
+    "clickjacking": "LOW",
+    "mime_sniffing": "LOW",
+    "referrer_leak": "LOW",
+}
+
+
+def _posture_findings(posture: list[dict], target_url: str) -> list[dict]:
+    """Convert recon missing-header findings into normalized findings."""
+    out: list[dict] = []
+    host = urlparse(target_url).netloc
+    for p in posture or []:
+        issue = p.get("issue", "")
+        header = p.get("missing_header", "")
+        severity = _POSTURE_SEVERITY.get(issue, "LOW")
+        title = f"Missing security header: {header}"
+        detail = f"Response is missing the {header} header ({issue})."
+        if _HAVE_FINDING:
+            nf = _finding.NormalizedFinding(
+                source_tool="recon.posture", host=host, url=target_url,
+                vuln_class_key="MISSING_SECURITY_HEADER", severity=severity,
+                title=title, detail=detail, evidence=header,
+                confidence="candidate", cwe="CWE-693", owasp="A05:2021",
+            )
+            d = nf.to_dict()
+            d["issue"] = issue
+        else:
+            d = {"source_tool": "recon.posture", "host": host, "url": target_url,
+                 "vuln_class_key": "MISSING_SECURITY_HEADER", "severity": severity,
+                 "title": title, "detail": detail, "evidence": header,
+                 "confidence": "candidate", "issue": issue}
+        out.append(d)
+    return out
+
+
+def _recon_only_findings(recon: dict, target_url: str) -> list[dict]:
+    """Findings derived purely from recon output (no heavy detectors)."""
+    findings = _secret_findings(recon.get("js_secrets", []), target_url)
+    findings += _posture_findings(recon.get("posture", []), target_url)
+    return findings
+
+
+async def _get_recon(args: argparse.Namespace, client, target_netloc: str) -> dict:
+    """Load a recon.json (--recon) or run recon (--chain-recon / --recon-only)."""
+    from toolkit.recon import run as recon_run
+    if args.recon:
+        with open(args.recon, "r", encoding="utf-8") as f:
+            return json.load(f)
+    log.info("running recon before scan")
+    return await recon_run.run_recon(
+        args.url, client, depth=args.depth, timeout=args.timeout)
+
+
 async def _load_recon_seeds(args: argparse.Namespace, client, target_netloc: str):
     """Return (same_origin_urls, subdomain_hosts, js_secrets) from
     --recon / --chain-recon."""
     from toolkit.recon import run as recon_run
-    if args.chain_recon:
-        log.info("running recon before scan")
-        recon = await recon_run.run_recon(
-            args.url, client, depth=args.depth, timeout=args.timeout)
-    elif args.recon:
-        with open(args.recon, "r", encoding="utf-8") as f:
-            recon = json.load(f)
-    else:
+    recon = await _get_recon(args, client, target_netloc)
+    if not recon:
         return [], [], []
     seeds = recon_run.recon_to_seeds(recon, target_netloc)
     return seeds["same_origin"], seeds["subdomain_hosts"], recon.get("js_secrets", [])
@@ -185,6 +237,25 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
                      args.rate, args.jitter, args.respect_robots, args.random_agent)
 
         target_netloc = urlparse(args.url).netloc
+
+        # --recon-only: skip the heavy detectors, emit recon-derived findings.
+        if args.recon_only:
+            recon = await _get_recon(args, client, target_netloc)
+            findings = _recon_only_findings(recon, args.url)
+            log.info("recon-only: %d findings (secrets=%d posture=%d)",
+                     len(findings),
+                     len(recon.get("js_secrets", []) or []),
+                     len(recon.get("posture", []) or []))
+            return {
+                "target": args.url,
+                "mode": "recon-only",
+                "endpoints_discovered": len(recon.get("js_endpoints", []) or [])
+                                     + len(recon.get("wayback_urls", []) or []),
+                "subdomains": recon.get("subdomains", []) or [],
+                "total_findings": len(findings),
+                "findings": findings,
+            }
+
         same_origin_seeds, subdomain_hosts, js_secrets = await _load_recon_seeds(
             args, client, target_netloc)
 

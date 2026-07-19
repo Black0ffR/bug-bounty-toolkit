@@ -41,3 +41,29 @@ def test_load_recon_seeds_reads_js_secrets(tmp_path):
     assert same_origin == [] and hosts == []
     assert secrets == [{"type": "jwt", "value": "eyJ.eyJ.xxx"}]
 
+
+def test_recon_only_findings_merges_secrets_and_posture():
+    recon = {
+        "js_secrets": [{"type": "aws_access_key_id", "value": "AKIA123"}],
+        "posture": [{"issue": "missing_hsts", "missing_header": "Strict-Transport-Security"},
+                    {"issue": "missing_csp", "missing_header": "Content-Security-Policy"}],
+    }
+    out = scan._recon_only_findings(recon, "https://example.com")
+    classes = {f["vuln_class_key"] for f in out}
+    assert "EXPOSED_SECRET" in classes
+    assert "MISSING_SECURITY_HEADER" in classes
+    hsts = [f for f in out if f.get("issue") == "missing_hsts"][0]
+    assert hsts["severity"] == "MEDIUM"  # HSTS is MEDIUM
+    csp = [f for f in out if f.get("issue") == "missing_csp"][0]
+    assert csp["severity"] == "LOW"
+
+
+def test_get_recon_loads_file(tmp_path):
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps({"js_secrets": [{"type": "jwt", "value": "x"}],
+                              "posture": []}))
+    args = types.SimpleNamespace(recon=str(p), chain_recon=False, recon_only=False)
+    recon = asyncio.run(scan._get_recon(args, None, "example.com"))
+    assert recon["js_secrets"] == [{"type": "jwt", "value": "x"}]
+
+

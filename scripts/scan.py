@@ -50,12 +50,13 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from toolkit.infra import spider, scope_guard, logfmt
+    from toolkit.infra import spider, scope_guard, logfmt, finding as _finding
     from toolkit.testers import (sqli, cmdi, lfi, ssti, openredirect, cors, csrf,
                                 idor, xxe, access_control, ssrf, nosqli,
                                 graphql, deserialization)
     from toolkit.verify import xss_context
     _HAVE_TOOLKIT = True
+    _HAVE_FINDING = True
 except Exception as exc:  # pragma: no cover
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     logging.error("toolkit import failed: %s", exc)
@@ -113,8 +114,53 @@ def _build_policy(args: argparse.Namespace):
                          respect_robots=False, random_agent=False)
 
 
+# Secrets found in JS are HIGH when they grant access (keys/tokens/private
+# keys) and MEDIUM for lower-impact identifiers.
+_SECRET_SEVERITY = {
+    "aws_access_key_id": "HIGH",
+    "private_key": "HIGH",
+    "jwt": "HIGH",
+    "github_token": "HIGH",
+    "slack_token": "MEDIUM",
+    "google_api_key": "MEDIUM",
+}
+
+
+def _secret_findings(secrets: list[dict], target_url: str) -> list[dict]:
+    """Convert recon js_secrets ([{type, value}]) into normalized findings."""
+    out: list[dict] = []
+    host = urlparse(target_url).netloc
+    for s in secrets or []:
+        stype = s.get("type", "unknown")
+        value = s.get("value", "")
+        if not value:
+            continue
+        severity = _SECRET_SEVERITY.get(stype, "MEDIUM")
+        title = f"Exposed secret in JavaScript ({stype})"
+        detail = (f"A candidate {stype} was extracted from bundled JavaScript "
+                  f"on {target_url}. Treat as leaked until proven otherwise.")
+        if _HAVE_FINDING:
+            nf = _finding.NormalizedFinding(
+                source_tool="recon.js", host=host, url=target_url,
+                vuln_class_key="EXPOSED_SECRET", severity=severity,
+                title=title, detail=detail, evidence=f"{stype}={value}",
+                confidence="candidate", cwe="CWE-798",
+                owasp="A05:2021",
+            )
+            d = nf.to_dict()
+            d["secret_type"] = stype
+        else:
+            d = {"source_tool": "recon.js", "host": host, "url": target_url,
+                 "vuln_class_key": "EXPOSED_SECRET", "severity": severity,
+                 "title": title, "detail": detail, "evidence": f"{stype}={value}",
+                 "confidence": "candidate", "secret_type": stype}
+        out.append(d)
+    return out
+
+
 async def _load_recon_seeds(args: argparse.Namespace, client, target_netloc: str):
-    """Return (same_origin_urls, subdomain_hosts) from --recon / --chain-recon."""
+    """Return (same_origin_urls, subdomain_hosts, js_secrets) from
+    --recon / --chain-recon."""
     from toolkit.recon import run as recon_run
     if args.chain_recon:
         log.info("running recon before scan")
@@ -124,9 +170,9 @@ async def _load_recon_seeds(args: argparse.Namespace, client, target_netloc: str
         with open(args.recon, "r", encoding="utf-8") as f:
             recon = json.load(f)
     else:
-        return [], []
+        return [], [], []
     seeds = recon_run.recon_to_seeds(recon, target_netloc)
-    return seeds["same_origin"], seeds["subdomain_hosts"]
+    return seeds["same_origin"], seeds["subdomain_hosts"], recon.get("js_secrets", [])
 
 
 async def _scan(args: argparse.Namespace) -> dict[str, Any]:
@@ -139,7 +185,7 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
                      args.rate, args.jitter, args.respect_robots, args.random_agent)
 
         target_netloc = urlparse(args.url).netloc
-        same_origin_seeds, subdomain_hosts = await _load_recon_seeds(
+        same_origin_seeds, subdomain_hosts, js_secrets = await _load_recon_seeds(
             args, client, target_netloc)
 
         log.info("crawling %s (depth=%d)", args.url, args.depth)
@@ -179,6 +225,12 @@ async def _scan(args: argparse.Namespace) -> dict[str, Any]:
         endpoints = list(merged.values())
         log.info("discovered %d endpoints (%d from recon seeds)",
                  len(endpoints), len(same_origin_seeds))
+
+        # Recon-discovered JS secrets become standalone findings.
+        if js_secrets:
+            secret_findings = _secret_findings(js_secrets, args.url)
+            log.info("JS-secret findings: %d", len(secret_findings))
+            findings.extend(secret_findings)
         params_total = sum(len(e.params) for e in endpoints)
         log.info("with %d injectable parameters", params_total)
 

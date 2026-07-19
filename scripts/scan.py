@@ -72,6 +72,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=10)
     p.add_argument("--timeout", type=float, default=12.0)
     p.add_argument("--no-xss", action="store_true", help="Skip XSS verification")
+    # Stealth mode
+    p.add_argument("--stealth", action="store_true",
+                   help="Enable low-and-slow stealth pacing (rate/jitter/UA rotation/robots)")
+    p.add_argument("--rate", type=float, default=1.0,
+                   help="Max requests/sec in stealth mode (default 1.0)")
+    p.add_argument("--jitter", type=float, default=0.5,
+                   help="Random delay multiplier 0..1 in stealth mode (default 0.5)")
+    p.add_argument("--respect-robots", dest="respect_robots", action="store_true",
+                   default=True)
+    p.add_argument("--no-respect-robots", dest="respect_robots", action="store_false")
+    p.add_argument("--random-agent", dest="random_agent", action="store_true", default=True)
+    p.add_argument("--no-random-agent", dest="random_agent", action="store_false")
+    p.add_argument("--proxy", default=None, help="Single upstream proxy URL")
+    p.add_argument("--proxy-list", default=None,
+                   help="Comma-separated proxy URLs for rotation")
     p.add_argument("--output", "-o", default="scan-findings.json")
     p.add_argument("--report", choices=("sarif", "csv", "hackerone", "bugcrowd"),
                    help="Also render a report in this format")
@@ -80,10 +95,27 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _build_policy(args: argparse.Namespace):
+    from toolkit.infra.stealth import StealthPolicy
+    if args.stealth:
+        proxy_list = [p.strip() for p in (args.proxy_list or "").split(",") if p.strip()]
+        return StealthPolicy(enabled=True, rate=args.rate, jitter=args.jitter,
+                             respect_robots=args.respect_robots,
+                             random_agent=args.random_agent,
+                             proxy=args.proxy, proxy_list=proxy_list)
+    # Non-stealth: no pacing, no robots gating, no UA spoofing.
+    return StealthPolicy(enabled=False, rate=1e9, jitter=0.0,
+                         respect_robots=False, random_agent=False)
+
+
 async def _scan(args: argparse.Namespace) -> dict[str, Any]:
     limits = httpx.Limits(max_connections=args.concurrency)
-    async with httpx.AsyncClient(timeout=args.timeout, follow_redirects=True,
-                                 limits=limits) as client:
+    from toolkit.infra.stealth import StealthClient
+    policy = _build_policy(args)
+    async with StealthClient(policy, timeout=args.timeout, limits=limits) as client:
+        if args.stealth:
+            log.info("STEALTH mode: rate=%.2f rps jitter=%.2f robots=%s ua=%s",
+                     args.rate, args.jitter, args.respect_robots, args.random_agent)
         log.info("crawling %s (depth=%d)", args.url, args.depth)
         endpoints = await spider.crawl(
             args.url, client, max_depth=args.depth, max_urls=args.max_urls,

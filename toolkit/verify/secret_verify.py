@@ -137,11 +137,19 @@ def _looks_like_placeholder(value: str) -> bool:
     if v in _PLACEHOLDERS:
         return True
     low = v.lower()
-    # Only flag clear placeholder tokens. Numeric runs (1234567890 / 0000000000)
-    # were previously matched as substrings but occur in legitimate high-entropy
-    # keys, producing false "dead/placeholder" dispositions. `testtest` is kept
+    # Word-like markers ('example'/'sample') only count when they form a
+    # standalone token, not when embedded inside a longer alphanumeric run. A
+    # real high-entropy key will never contain a bare 'example'/'sample' token,
+    # but a bare substring match previously over-flagged any value merely
+    # containing the letters 'example' as a placeholder and rejected it.
+    # Documented examples such as AKIAEXAMPLE / AKIAIOSFODNN7EXAMPLE are still
+    # caught by the exact _PLACEHOLDERS set above.
+    if re.search(r"(?<![a-z0-9])(example|sample)(?![a-z0-9])", low):
+        return True
+    # Verbatim markers from provider docs — these essentially never occur in
+    # real random keys, so substring matching is safe. `testtest` is kept
     # because provider docs use it verbatim (e.g. ghp_testtest...).
-    if any(p in low for p in ("example", "testtest", "placeholder", "your_key",
+    if any(p in low for p in ("testtest", "placeholder", "your_key",
                               "yourkey", "xxxxxx", "changeme")):
         return True
     return False

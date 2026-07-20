@@ -47,10 +47,14 @@ def test_verify_secret_uses_registry_for_aws(capsys):
     # A non-placeholder AWS key triggers the registered handler (network may
     # fail, but the registry path must be taken, not the old if/elif chain).
     import asyncio
-    # Use a placeholder so no network call — registry still resolves aws handler.
+    # AKIAEXAMPLE1111111111 is NOT a placeholder under the tightened boundary
+    # rule (the 'example' substring must be a standalone token), so this goes
+    # through the registered AWS handler — which returns early (no network) when
+    # the secret is absent. That still proves the registry dispatch path is used.
     res = asyncio.run(m.verify_secret("AKIAEXAMPLE1111111111", provider_hint="aws_access_key_id"))
     assert res.provider == "aws_access_key_id"
-    assert "placeholder" in res.detail.lower()
+    assert "placeholder" not in res.detail.lower()
+    assert "cannot verify" in res.detail.lower()
 
 
 def test_verify_secret_unknown_provider_is_candidate():

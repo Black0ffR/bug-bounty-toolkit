@@ -73,6 +73,21 @@ def test_placeholder_no_false_positive_on_real_looking_keys():
     assert _looks_like_placeholder("changeme_please")  # real placeholder token
 
 
+def test_placeholder_example_requires_token_boundary():
+    """'example' only flags as a placeholder when it forms a standalone token,
+    not when embedded inside a longer alphanumeric run (P0-3 tightening — the
+    bare substring previously over-matched and rejected legitimate-looking
+    values that merely contained the letters 'example')."""
+    # Embedded inside random-ish data -> NOT a placeholder
+    assert not _looks_like_placeholder("AKIAEXAMPLE1234567890ABCD")
+    assert not _looks_like_placeholder("ghp_abcdexampleqrstuvwxyz0123456789abcd")
+    # Standalone-token forms -> placeholder
+    assert _looks_like_placeholder("your-example-key")
+    assert _looks_like_placeholder("AKIAEXAMPLE")  # also covered by exact set
+    # Real-looking high-entropy key untouched
+    assert not _looks_like_placeholder("AKIAIOSFODNN7REALKEY")
+
+
 def test_redact_short_value():
     assert _redact("abc") == "***"
 

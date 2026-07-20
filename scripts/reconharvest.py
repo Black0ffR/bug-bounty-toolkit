@@ -1396,7 +1396,7 @@ async def main() -> None:
     args = parse_args()
     if _HAVE_LOGFMT:
         _logfmt.configure_logging(
-            format=args.log_format,
+            fmt=args.log_format,
             level=logging.DEBUG if args.verbose else logging.INFO,
         )
     elif args.verbose:

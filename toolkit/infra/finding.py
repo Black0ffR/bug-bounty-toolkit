@@ -63,7 +63,7 @@ _DEFAULT_DISPOSITION = "new"
 # finding: long numeric runs (status codes, byte sizes, durations, timestamps),
 # long hex blobs (response ids, hashes), and URLs (which embed random paths).
 _VOLATILE_EVIDENCE_RE = re.compile(
-    r"https?://[^\s'\"]+|0x[0-9a-fA-F]+|\b[0-9a-fA-F]{12,}\b|\b[0-9]{3,}\b"
+    r"https?://[^\s'\"]+|0x[0-9a-fA-F]+|\b[0-9a-fA-F]{12,}\b|\b[0-9]{3,}[A-Za-z]*\b"
 )
 
 

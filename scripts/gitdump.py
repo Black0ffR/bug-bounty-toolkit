@@ -372,7 +372,7 @@ async def fetch(
         return None, {}, b"" if binary else ""
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False,
+            timeout=timeout, verify=True,
             follow_redirects=True,
             headers={"User-Agent": UA},
         ) as c:

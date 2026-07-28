@@ -314,7 +314,7 @@ def test_sweep_blast_radius_concurrent(mock_http_server, temp_scope_yaml):
     headers = {"Cookie": "session=user-b"}
 
     async def _run() -> int:
-        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=False) as client:
             return await _sweep_blast_radius(
                 client, guard, headers,
                 f"{base_url}/api/users/1", "1", neighbors, concurrency=5,

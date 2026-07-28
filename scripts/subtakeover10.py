@@ -1181,7 +1181,7 @@ class HTTPFingerprinter:
             try:
                 async with httpx.AsyncClient(
                     timeout=self.timeout, follow_redirects=True,
-                    verify=False, headers=self.HEADERS,
+                    verify=True, headers=self.HEADERS,
                 ) as c:
                     resp = await c.get(f"{scheme}://{host}")
                     body = resp.text[:self.SNIPPET]

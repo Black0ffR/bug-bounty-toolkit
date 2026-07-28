@@ -367,6 +367,10 @@ def _open_url_default(url: str) -> bool:
     if a handler was launched."""
     import shutil
     import subprocess
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
     for cmd in (["xdg-open"], ["open"], ["termux-open-url"]):
         if shutil.which(cmd[0]):
             try:

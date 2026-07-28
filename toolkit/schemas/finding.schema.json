@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://subtakeover.local/schemas/finding.schema.json",
+  "title": "NormalizedFinding",
+  "description": "Canonical finding schema shared by every tool in the pipeline. Extends nuclei-harvest.py's NormalizedFinding dataclass with four cross-run persistence + verification tracking fields (confidence, disposition, first_seen, last_seen, verified_by). All new tools must emit this shape natively; existing tools are patched to add the new fields with safe defaults.",
+  "type": "object",
+  "required": [
+    "id",
+    "source_tool",
+    "host",
+    "url",
+    "vuln_class_key",
+    "severity",
+    "title",
+    "confidence",
+    "disposition"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable identifier. SHOULD be sha256(source_tool+host+vuln_class_key+evidence) truncated to 16 hex chars; nuclei-harvest.py's existing 'tool:host:title'[:8] + '_' + abs(hash)%100000 form is accepted for legacy findings."
+    },
+    "source_tool": {
+      "type": "string",
+      "description": "Filename of the originating tool, e.g. 'apifuzz.py', 'idor_crosssession.py'."
+    },
+    "host": { "type": "string" },
+    "url": { "type": "string" },
+    "vuln_class_key": {
+      "type": "string",
+      "description": "Key into nuclei-harvest.py's VULN_CLASSES dict (SUBDOMAIN_TAKEOVER, BOLA_CONFIRMED, BOLA_POSSIBLE, etc.). New tools introducing a novel class MUST register it via FINDING_TYPE_MAP."
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    },
+    "title": { "type": "string" },
+    "detail": { "type": "string", "default": "" },
+    "evidence": { "type": "string", "default": "" },
+    "steps_to_reproduce": { "type": "string", "default": "" },
+    "remediation": { "type": "string", "default": "" },
+    "curl_command": { "type": "string", "default": "" },
+    "cvss_score": { "type": "number", "default": 0.0 },
+    "cvss_vector": { "type": "string", "default": "" },
+    "cwe": { "type": "string", "default": "" },
+    "owasp": { "type": "string", "default": "" },
+    "impact_tier": {
+      "type": "string",
+      "enum": ["", "P1", "P2", "P3", "P4", "P5"],
+      "default": ""
+    },
+    "typical_payout": { "type": "string", "default": "" },
+    "allows_write": { "type": "boolean", "default": false },
+    "chain_ids": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "nuclei_template": { "type": "string", "default": "" },
+    "raw": { "type": "object", "default": {} },
+
+    "confidence": {
+      "type": "string",
+      "enum": ["candidate", "probable", "confirmed"],
+      "default": "candidate",
+      "description": "candidate = tool-flagged heuristic, needs human/verifier follow-up. probable = secondary signal corroborates but no live proof. confirmed = a Layer 4 verifier produced live cross-session/OOB proof, OR a human marked disposition=submitted."
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["new", "reviewed", "submitted", "rejected", "duplicate_of"],
+      "default": "new",
+      "description": "Workflow state. 'duplicate_of' should be paired with a duplicate_of_id field in raw."
+    },
+    "first_seen": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC. Set by pipeline_state.upsert_finding on first observation."
+    },
+    "last_seen": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC. Updated on every observation."
+    },
+    "verified_by": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Tool name (e.g. 'idor_crosssession.py') if a Layer 4 verifier confirmed this finding; else null."
+    }
+  },
+  "additionalProperties": true
+}

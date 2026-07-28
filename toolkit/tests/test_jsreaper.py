@@ -22,7 +22,7 @@ def test_fetch_propagates_cookie_and_extra_headers(mock_http_server):
     server.routes = {("GET", "/asset.js"): {"status": 200, "body": "console.log(1)"}}
 
     async def _run():
-        async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+        async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=True) as client:
             await jsreaper.fetch(
                 f"{base_url}/asset.js", client=client,
                 cookie="session=abc", extra_headers={"X-Custom": "1"},
@@ -41,7 +41,7 @@ def test_fetch_without_auth_sends_only_ua(mock_http_server):
     server.routes = {("GET", "/plain.js"): {"status": 200, "body": "x=1"}}
 
     async def _run():
-        async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+        async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=True) as client:
             await jsreaper.fetch(f"{base_url}/plain.js", client=client)
 
     asyncio.run(_run())
@@ -60,7 +60,7 @@ def test_user_agent_override_applied(mock_http_server):
         server.routes = {("GET", "/ua.js"): {"status": 200, "body": "x"}}
 
         async def _run():
-            async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+            async with jsreaper.httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=True) as client:
                 await jsreaper.fetch(f"{base_url}/ua.js", client=client)
 
         asyncio.run(_run())

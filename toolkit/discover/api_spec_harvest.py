@@ -141,7 +141,7 @@ async def probe_spec(base_url: str, client=None, spec_path: str | None = None
 
     own = client is None
     if own:
-        client = httpx.AsyncClient(follow_redirects=True, timeout=15.0, verify=False)
+        client = httpx.AsyncClient(follow_redirects=True, timeout=15.0, verify=True)
     try:
         candidates = [spec_path] if spec_path else COMMON_SPEC_PATHS
         for cand in candidates:

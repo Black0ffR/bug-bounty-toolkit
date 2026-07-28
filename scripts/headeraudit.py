@@ -368,7 +368,7 @@ async def get_with_origin(
     }
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False,
+            timeout=timeout, verify=True,
             follow_redirects=True, headers=hdrs,
         ) as c:
             resp = await c.get(url)
@@ -389,7 +389,7 @@ async def get_base(
         return None, {}, "", url
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False,
+            timeout=timeout, verify=True,
             follow_redirects=True,
             headers={"User-Agent": UA,
                      "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},

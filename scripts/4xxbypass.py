@@ -525,7 +525,7 @@ async def send_attempt(
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
-            verify=False,
+            verify=True,
             follow_redirects=False,   # don't follow — we want to see redirect targets
         ) as c:
             if attempt.method == "GET":
@@ -558,7 +558,7 @@ async def get_baseline(url: str, timeout: float = 10.0) -> tuple[int, int, str]:
     hdrs = {"User-Agent": UA}
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False,
+            timeout=timeout, verify=True,
             follow_redirects=False, headers=hdrs,
         ) as c:
             resp = await c.get(url)

@@ -375,7 +375,7 @@ async def scan_endpoint(endpoint: str, method: str, param_name: str,
     token = _gen_token()
     test_files = _build_test_files(token)
     results: list[UploadResult] = []
-    async with httpx.AsyncClient(timeout=15.0, verify=False, follow_redirects=False) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=True, follow_redirects=False) as client:
         for tf in test_files:
             if not guard.acquire_token(timeout=20.0):
                 continue
@@ -388,7 +388,7 @@ async def scan_endpoint(endpoint: str, method: str, param_name: str,
                      tf.name, r.response_status, r.actually_blocked, r.severity)
         # B13 — closed-loop confirmation: for any accepted script-like upload,
         # verify whether it is served back and executed. SAFE: GET-only.
-        verify_client = httpx.AsyncClient(timeout=15.0, verify=False, follow_redirects=True)
+        verify_client = httpx.AsyncClient(timeout=15.0, verify=True, follow_redirects=True)
         try:
             for r in results:
                 await verify_served(verify_client, endpoint, r, guard)

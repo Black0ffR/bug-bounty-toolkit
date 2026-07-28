@@ -375,7 +375,7 @@ async def probe(
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
-            verify=False,
+            verify=True,
             follow_redirects=False,
         ) as c:
             if method.upper() == "GET":
@@ -584,7 +584,7 @@ async def poll_interactsh(
     if not HAS_HTTPX:
         return []
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as c:
+        async with httpx.AsyncClient(timeout=timeout, verify=True) as c:
             resp = await c.get(
                 api_url,
                 headers={"Authorization": secret_key}

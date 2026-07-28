@@ -54,7 +54,7 @@ _shared_clients: dict[int, httpx.AsyncClient] = {}
 
 def build_client(
     *,
-    verify: bool = False,
+    verify: bool = True,
     follow_redirects: bool = True,
     timeout: float = 30.0,
     limits: httpx.Limits | None = None,
@@ -82,7 +82,7 @@ def _loop_key() -> int:
 
 async def get_shared_client(
     *,
-    verify: bool = False,
+    verify: bool = True,
     follow_redirects: bool = True,
     timeout: float = 30.0,
     limits: httpx.Limits | None = None,

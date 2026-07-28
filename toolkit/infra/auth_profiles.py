@@ -115,7 +115,7 @@ def redact_value(key: str, value: Any) -> Any:
     """If key is sensitive, return a redacted placeholder; else return value unchanged."""
     if key.lower() in _SENSITIVE_FIELDS and isinstance(value, str):
         if len(value) > 12:
-            return value[:4] + "…" + _REDACT_REPLACEMENT
+            return value[:2] + "…" + _REDACT_REPLACEMENT
         return _REDACT_REPLACEMENT
     return value
 
@@ -276,7 +276,7 @@ class AuthProfiles:
 
     # ── Session factory ──────────────────────────────────────────────────────
 
-    def get_session(self, name: str, *, timeout: float = 15.0, verify: bool = False,
+    def get_session(self, name: str, *, timeout: float = 15.0, verify: bool = True,
                     follow_redirects: bool = True, ua: str = "Mozilla/5.0 (compatible; ToolkitAuth/1.0)"
                     ) -> "AuthenticatedSession":
         """Return a session object bound to this profile. The session exposes

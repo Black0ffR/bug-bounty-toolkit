@@ -208,7 +208,7 @@ async def http_get(
     hdrs = {"User-Agent": UA, **(headers or {})}
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False,
+            timeout=timeout, verify=True,
             follow_redirects=follow_redirects, headers=hdrs,
         ) as c:
             resp = await c.get(url)
@@ -236,7 +236,7 @@ async def http_post(
     }
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
+            timeout=timeout, verify=True, follow_redirects=False,
         ) as c:
             if json_body:
                 resp = await c.post(url, headers=hdrs, json=json_body)

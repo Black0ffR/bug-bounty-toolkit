@@ -309,7 +309,7 @@ async def check_aws(access_key: str, secret_key: str | None = None) -> SecretChe
             "Host": "sts.amazonaws.com",
         }
         import httpx
-        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True) as client:
             r = await client.get(endpoint + "?" + canonical_query, headers=headers)
         if r.status_code == 200:
             data = r.text
@@ -356,7 +356,7 @@ async def check_github(token: str) -> SecretCheck:
     redacted = _redact(token)
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True) as client:
             r = await client.get(
                 "https://api.github.com/user",
                 headers={"Authorization": f"Bearer {token}",
@@ -400,7 +400,7 @@ async def check_slack(token: str) -> SecretCheck:
     redacted = _redact(token)
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True) as client:
             r = await client.post(
                 "https://slack.com/api/auth.test",
                 headers={"Authorization": f"Bearer {token}",
@@ -455,7 +455,7 @@ async def check_stripe(key: str) -> SecretCheck:
         )
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True) as client:
             r = await client.get(
                 "https://api.stripe.com/v1/balance",
                 auth=(key, ""),
@@ -499,7 +499,7 @@ async def check_google_api_key(key: str) -> SecretCheck:
     redacted = _redact(key)
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True) as client:
             r = await client.get(
                 "https://maps.googleapis.com/maps/api/geocode/json",
                 params={"address": "Mountain View, CA", "key": key},

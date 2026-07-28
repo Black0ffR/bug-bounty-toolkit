@@ -396,7 +396,7 @@ async def verify_all(endpoints: list[dict[str, Any]], guard: scope_guard.ScopeGu
     except ImportError:
         log.error("httpx is required for xss_context.py — pip install httpx")
         return []
-    async with httpx.AsyncClient(timeout=15.0, verify=False, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=True, follow_redirects=True) as client:
         async def _one(ep: dict[str, Any]) -> list[XssFinding]:
             async with sem:
                 return await verify_endpoint(client, ep, guard)

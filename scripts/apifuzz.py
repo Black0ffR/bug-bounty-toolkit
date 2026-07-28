@@ -310,7 +310,7 @@ async def api_request(
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
-            verify=False,
+            verify=True,
             follow_redirects=follow_redirects,
         ) as c:
             if method.upper() == "GET":

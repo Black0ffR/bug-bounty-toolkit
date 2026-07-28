@@ -18,6 +18,7 @@ reports/
 *.json
 !toolkit/**/testdata/*.json
 !toolkit/configs/*.example.yaml
+!toolkit/schemas/*.json
 
 # Python
 __pycache__/

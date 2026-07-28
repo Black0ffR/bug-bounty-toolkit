@@ -430,7 +430,7 @@ async def fetch(
             resp = await client.get(url, headers=hdrs)
         else:
             async with httpx.AsyncClient(
-                timeout=timeout, verify=False,
+                timeout=timeout, verify=True,
                 follow_redirects=True, headers=hdrs,
             ) as c:
                 resp = await c.get(url)
@@ -868,7 +868,7 @@ class HostProcessor:
         scheme = "https"
         port   = 443
         async with httpx.AsyncClient(
-            timeout=self.timeout, verify=False,
+            timeout=self.timeout, verify=True,
             follow_redirects=True, headers={"User-Agent": user_agent()},
         ) as client:
             status, _, _ = await fetch(f"https://{host}/", client=client, max_size_kb=10,

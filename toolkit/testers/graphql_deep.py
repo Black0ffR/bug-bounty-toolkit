@@ -417,7 +417,7 @@ async def scan_endpoint(endpoint: str, guard: scope_guard.ScopeGuard) -> list[Gq
         log.error("httpx required for graphql_deep.py")
         return []
     findings: list[GqlFinding] = []
-    async with httpx.AsyncClient(timeout=20.0, verify=False, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=20.0, verify=True, follow_redirects=True) as client:
         # 1. Introspection
         if not guard.acquire_token(timeout=20.0):
             return []

@@ -222,7 +222,7 @@ async def http_get(
     hdrs = {"User-Agent": UA, **(headers or {})}
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, verify=False,
+            timeout=timeout, verify=True,
             follow_redirects=follow_redirects, headers=hdrs,
         ) as c:
             resp = await c.get(url)
@@ -239,7 +239,7 @@ async def http_put(
     if not HAS_HTTPX:
         return None
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as c:
+        async with httpx.AsyncClient(timeout=timeout, verify=True) as c:
             resp = await c.put(url, content=body,
                                headers={"User-Agent": UA})
             return resp.status_code

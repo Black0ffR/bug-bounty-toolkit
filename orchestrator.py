@@ -160,10 +160,37 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
+_SENSITIVE_FLAGS: frozenset = frozenset({
+    "--session-a", "--session-b", "--bearer", "--token", "--cookie",
+    "--api-key", "--api_secret", "--secret", "--password",
+})
+
+
+def _sanitize_cmd(cmd: list[str]) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in cmd:
+        if skip:
+            out.append("***")
+            skip = False
+            continue
+        if arg in _SENSITIVE_FLAGS:
+            out.append(arg)
+            skip = True
+            continue
+        for flag in _SENSITIVE_FLAGS:
+            if arg.startswith(f"{flag}="):
+                out.append(f"{flag}=***")
+                break
+        else:
+            out.append(arg)
+    return out
+
+
 def _run_subprocess(cmd: list[str], *, timeout: int = 1800,
                      cwd: Path | None = None) -> tuple[int, str, str]:
     """Run a subprocess, capture stdout/stderr. Returns (rc, out, err)."""
-    log.info("$ %s", " ".join(cmd))
+    log.info("$ %s", " ".join(_sanitize_cmd(cmd)))
     try:
         p = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
@@ -815,7 +842,7 @@ def main() -> int:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_target = args.target.replace("/", "_").replace(":", "_")
     work_dir = Path(args.output_dir) / safe_target / timestamp
-    work_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log.info("work directory: %s", work_dir)
 
     ctx = OrchestratorContext(

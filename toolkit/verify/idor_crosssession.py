@@ -323,7 +323,7 @@ async def verify_finding(finding: dict[str, Any], profiles: AuthProfiles,
         import httpx
         merged_a = {**sess_a.profile.auth_headers(), **user_a_headers}
         merged_b = {**profiles.get_profile(prof_b.name).auth_headers(), **user_b_headers}
-        async with httpx.AsyncClient(timeout=12.0, verify=False, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=12.0, verify=True, follow_redirects=False) as client:
             # User A replay
             s_a, body_a, len_a = await _replay_with_client(
                 client, parsed["method"], parsed["url"], merged_a, parsed["body"]

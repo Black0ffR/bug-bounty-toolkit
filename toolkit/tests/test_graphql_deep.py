@@ -55,7 +55,7 @@ def test_depth_dos_flags_no_limit(mock_http_server):
     server.routes = {("POST", "/graphql"): route}
 
     async def _run():
-        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=True) as client:
             return await graphql_deep.test_depth_dos(
                 client, f"{base_url}/graphql", max_depth=50, step=5, schema=_RECURSIVE_SCHEMA
             )
@@ -81,7 +81,7 @@ def test_depth_dos_detects_depth_limit(mock_http_server):
     server.routes = {("POST", "/graphql"): route}
 
     async def _run():
-        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=True) as client:
             return await graphql_deep.test_depth_dos(
                 client, f"{base_url}/graphql", max_depth=50, step=5, schema=_RECURSIVE_SCHEMA
             )
@@ -99,7 +99,7 @@ def test_depth_dos_skips_without_schema(mock_http_server):
         "body": json.dumps({"data": {"__typename": "OK"}})}}
 
     async def _run():
-        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=True, follow_redirects=True) as client:
             return await graphql_deep.test_depth_dos(
                 client, f"{base_url}/graphql", max_depth=50, step=5, schema=None
             )

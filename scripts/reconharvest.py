@@ -395,7 +395,7 @@ async def http_get(
             resp = await client.get(url, headers=hdrs)
         else:
             async with httpx.AsyncClient(
-                timeout=timeout, verify=False, follow_redirects=False, headers=hdrs
+                timeout=timeout, verify=True, follow_redirects=False, headers=hdrs
             ) as c:
                 resp = await c.get(url)
         return resp.status_code, dict(resp.headers), resp.text[:3000], resp.headers.get("location")
@@ -420,7 +420,7 @@ async def http_post(
                           if json_body else client.post(url, content=data or "", headers=hdrs))
         else:
             async with httpx.AsyncClient(
-                timeout=timeout, verify=False, follow_redirects=False
+                timeout=timeout, verify=True, follow_redirects=False
             ) as c:
                 resp = await (c.post(url, json=json_body, headers=hdrs)
                               if json_body else c.post(url, content=data or "", headers=hdrs))
@@ -676,7 +676,7 @@ class HostProber:
         first_bodies: list[str] = []
 
         async with httpx.AsyncClient(
-            timeout=self.timeout, verify=False, follow_redirects=False,
+            timeout=self.timeout, verify=True, follow_redirects=False,
             headers={"User-Agent": user_agent()},
         ) as client:
             for path in paths[:2]:

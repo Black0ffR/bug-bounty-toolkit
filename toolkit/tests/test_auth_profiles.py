@@ -54,7 +54,7 @@ def test_auth_headers_cookie_and_custom():
 
 
 def test_redact_value_masks_long_secrets():
-    assert redact_value("cookie", "session=abc123def456") == "sess…<redacted>"
+    assert redact_value("cookie", "session=abc123def456") == "se…<redacted>"
     # Short values get fully redacted
     assert redact_value("password", "abc") == "<redacted>"
     # Non-sensitive keys pass through

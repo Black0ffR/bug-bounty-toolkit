@@ -55,15 +55,40 @@ License : MIT (for authorized use only)
 
 from __future__ import annotations
 
+import copy
 import datetime
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+# Keys whose values are stripped before writing to payload_json (they may
+# contain raw credentials, bearer tokens, JWTs, etc. that shouldn't live
+# in plaintext on disk).
+_SENSITIVE_PAYLOAD_KEYS: frozenset = frozenset({
+    "bearer", "cookie", "api_key", "apikey", "password", "secret", "token",
+    "auth_headers", "raw_credentials", "session_key", "private_key",
+    "access_key", "secret_key", "client_secret", "refresh_token",
+})
+
+
+def _sanitize_payload(finding: dict[str, Any]) -> str:
+    """Return a JSON string with known sensitive key-values redacted."""
+    safe = copy.deepcopy(finding)
+    for k in list(safe.keys()):
+        if k.lower() in _SENSITIVE_PAYLOAD_KEYS:
+            safe[k] = "<redacted>"
+        elif isinstance(safe[k], dict):
+            for sub_k in list(safe[k].keys()):
+                if sub_k.lower() in _SENSITIVE_PAYLOAD_KEYS:
+                    safe[k][sub_k] = "<redacted>"
+    return json.dumps(safe, default=str)
 
 
 # ── C29: FTS synonym expansion ────────────────────────────────────────────────
@@ -230,6 +255,8 @@ class PipelineState:
         self._fts_available = False
         self._conn = sqlite3.connect(str(self.path), timeout=10, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        if self.path.exists():
+            self.path.chmod(0o600)
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -375,7 +402,7 @@ class PipelineState:
                         finding.get("confidence", ""),
                         finding.get("disposition", ""),
                         finding.get("verified_by"),
-                    json.dumps(finding, default=str) if finding else None,
+                    _sanitize_payload(finding) if finding else None,
                         now,
                         fid,
                     ),
@@ -402,7 +429,7 @@ class PipelineState:
                     finding.get("verified_by"),
                     first_seen,
                     now,
-                    json.dumps(finding, default=str),
+                    _sanitize_payload(finding),
                     now,
                 ),
             )
